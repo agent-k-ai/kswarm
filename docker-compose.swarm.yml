@@ -1,0 +1,436 @@
+# kswarm: the containerized Python stack (docs/containers.md).
+#
+#   local  profile: local validator with the protocol program, stand-in KAI mint,
+#                   generated wallets, bootstrap, the three daemons.
+#   devnet profile: external RPC (KSWARM_RPC_URL), external mint
+#                   (KSWARM_PAYMENT_MINT), operator-provided wallet files in
+#                   KSWARM_WALLETS_DIR, bootstrap registers and stakes only.
+#   tools  profile: the operator CLI, for `docker compose run --rm cli ...`.
+#
+# Images: build from docker/swarm/Dockerfile (default) or pull the tagged release
+# with KSWARM_IMAGE_PREFIX and KSWARM_IMAGE_TAG, digest-pinned by the operator.
+#
+# No docker socket, no host paths outside the repository, no keys in the file.
+name: kswarm
+
+x-build-args: &build-args
+  GIT_SHA: ${KSWARM_GIT_SHA:-unknown}
+  GIT_REF: ${KSWARM_GIT_REF:-unknown}
+  BUILD_DATE: ${KSWARM_BUILD_DATE:-unknown}
+  VERSION: ${KSWARM_IMAGE_TAG:-0.1.0}
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-hardened: &hardened
+  restart: unless-stopped
+  read_only: true
+  user: "10001:10001"
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  logging: *logging
+  stop_grace_period: 30s
+
+x-worker-limits: &worker-limits
+  resources:
+    limits:
+      cpus: "1.0"
+      memory: 1g
+
+# Environment shared by the daemons and the CLI. The profile is selected with
+# KSWARM_CLUSTER; the RPC with KSWARM_RPC_URL (defaults fit the local profile).
+x-swarm-env: &swarm-env
+  KSWARM_CLUSTER: ${KSWARM_CLUSTER:-local}
+  KSWARM_RPC_URL: ${KSWARM_RPC_URL:-http://validator:8899}
+  KSWARM_IPFS_API_URL: http://ipfs:5001
+  KSWARM_IPFS_MAX_BYTES: ${KSWARM_IPFS_MAX_BYTES:-8388608}
+
+x-llm-env: &llm-env
+  LLM_BASE_URL: ${LLM_BASE_URL:?set LLM_BASE_URL to an OpenAI-compatible chat completions endpoint}
+  LLM_MODEL_NAME: ${LLM_MODEL_NAME:?set LLM_MODEL_NAME}
+  LLM_API_KEY: ${LLM_API_KEY:-local-llm}
+  LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-12000}
+
+# The daemons read their wallet and cluster profile from the CLI config volume
+# and write nothing under HOME, so HOME stays on the read-only root filesystem.
+x-config-volume-ro: &config-volume-ro
+  type: volume
+  source: cli-config
+  target: /home/kswarm/.config/kswarm
+  read_only: true
+
+x-config-volume-rw: &config-volume-rw
+  type: volume
+  source: cli-config
+  target: /home/kswarm/.config/kswarm
+
+x-runs-volume: &runs-volume
+  type: volume
+  source: predict-runs
+  target: /var/lib/kswarm/predict_runs
+
+x-tmp: &tmp
+  type: tmpfs
+  target: /tmp
+  tmpfs:
+    size: 67108864
+
+# Operator-provided wallet files (devnet): <name>.json per wallet, mounted over
+# the wallets directory of the config volume.
+x-wallets-bind: &wallets-bind
+  type: bind
+  source: ${KSWARM_WALLETS_DIR:-./secrets/wallets}
+  target: /home/kswarm/.config/kswarm/wallets
+  read_only: true
+
+x-branch-worker: &branch-worker
+  <<: *hardened
+  image: ${KSWARM_IMAGE_PREFIX:-kswarm}/branch-worker:${KSWARM_IMAGE_TAG:-local}
+  build:
+    context: .
+    dockerfile: docker/swarm/Dockerfile
+    target: branch-worker
+    args: *build-args
+  environment: &branch-worker-env
+    <<: [*swarm-env, *llm-env]
+    KSWARM_WALLET_FILE: /home/kswarm/.config/kswarm/wallets/${KSWARM_BRANCH_WORKER_WALLET:-worker-a}.json
+    KSWARM_WORKER_MAX_CLAIMS: ${KSWARM_WORKER_MAX_CLAIMS:-2}
+    KSWARM_WORKER_POLL_SECONDS: ${KSWARM_WORKER_POLL_SECONDS:-2.0}
+    KSWARM_CLAIM_COOLDOWN_SECONDS: ${KSWARM_CLAIM_COOLDOWN_SECONDS:-300}
+    KSWARM_EXECUTE_DEADLINE_MARGIN_SECONDS: ${KSWARM_EXECUTE_DEADLINE_MARGIN_SECONDS:-120}
+  deploy: *worker-limits
+  depends_on:
+    ipfs:
+      condition: service_healthy
+
+x-verifier-worker: &verifier-worker
+  <<: *hardened
+  image: ${KSWARM_IMAGE_PREFIX:-kswarm}/verifier-worker:${KSWARM_IMAGE_TAG:-local}
+  build:
+    context: .
+    dockerfile: docker/swarm/Dockerfile
+    target: verifier-worker
+    args: *build-args
+  environment: &verifier-worker-env
+    <<: [*swarm-env, *llm-env]
+    KSWARM_WALLET_FILE: /home/kswarm/.config/kswarm/wallets/${KSWARM_VERIFIER_WALLET:-verifier}.json
+    KSWARM_WORKER_POLL_SECONDS: ${KSWARM_WORKER_POLL_SECONDS:-2.0}
+    # Re-execution is the default; hash-only must be chosen by name (PR #7).
+    VERIFIER_REEXECUTE: ${VERIFIER_REEXECUTE:-true}
+    VERIFIER_HASH_ONLY: ${VERIFIER_HASH_ONLY:-false}
+    KSWARM_CHALLENGE_ON_MISMATCH: ${KSWARM_CHALLENGE_ON_MISMATCH:-true}
+  deploy: *worker-limits
+  depends_on:
+    ipfs:
+      condition: service_healthy
+
+x-aggregator-runner: &aggregator-runner
+  <<: *hardened
+  image: ${KSWARM_IMAGE_PREFIX:-kswarm}/aggregator-runner:${KSWARM_IMAGE_TAG:-local}
+  build:
+    context: .
+    dockerfile: docker/swarm/Dockerfile
+    target: aggregator-runner
+    args: *build-args
+  # Without a settle daemon in the Python stack the branch jobs stay `completed`
+  # until `kswarm settle` runs; the runner therefore aggregates attested
+  # branches. Set KSWARM_AGGREGATOR_ARGS="" to require settled branches.
+  command: ${KSWARM_AGGREGATOR_ARGS:---allow-completed-branches}
+  environment: &aggregator-runner-env
+    <<: *swarm-env
+    KSWARM_WALLET_FILE: /home/kswarm/.config/kswarm/wallets/${KSWARM_AGGREGATOR_WALLET:-aggregator}.json
+    KSWARM_WORKER_POLL_SECONDS: ${KSWARM_WORKER_POLL_SECONDS:-2.0}
+    KSWARM_BONSOL_AGGREGATE_COMMAND: ${KSWARM_BONSOL_AGGREGATE_COMMAND:-}
+    KSWARM_BONSOL_HOOK_TIMEOUT_SECONDS: ${KSWARM_BONSOL_HOOK_TIMEOUT_SECONDS:-1800}
+  deploy: *worker-limits
+  depends_on:
+    ipfs:
+      condition: service_healthy
+
+services:
+  # --- local profile: chain --------------------------------------------------------
+  # `initialize_protocol` accepts only the program's upgrade authority, so the admin
+  # wallet exists before the validator starts and the program is loaded as an
+  # upgradeable program with that key as its authority.
+  keygen:
+    <<: *hardened
+    profiles: [local]
+    restart: "no"
+    image: ${KSWARM_IMAGE_PREFIX:-kswarm}/cli:${KSWARM_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: docker/swarm/Dockerfile
+      target: cli
+      args: *build-args
+    command: ["wallet", "create", "admin"]
+    environment: *swarm-env
+    volumes:
+      - *config-volume-rw
+      - *tmp
+
+  validator:
+    profiles: [local]
+    image: anzaxyz/agave:v2.1.21@sha256:45eee2ce535d1c72e68637172ea506ac33a7178c86cd6453159e6d7cede13b6f
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    logging: *logging
+    environment:
+      KSWARM_PROGRAM_ID: ${KSWARM_PROGRAM_ID:-ERNzRcYhX6UYboXAAP7vwzbCKsULYu21R4RFNvDD8CkM}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        exec solana-test-validator --reset --quiet --ledger /ledger
+        --bind-address 0.0.0.0 --rpc-port 8899 --faucet-port 9900
+        --limit-ledger-size 50000000
+        --upgradeable-program "$$KSWARM_PROGRAM_ID" /programs/kswarm_protocol.so
+        "$$(solana-keygen pubkey /run/kswarm/config/wallets/admin.json)"
+    volumes:
+      - type: bind
+        source: ${KSWARM_PROGRAM_SO:-./solana/target/deploy/kswarm_protocol.so}
+        target: /programs/kswarm_protocol.so
+        read_only: true
+      - type: volume
+        source: cli-config
+        target: /run/kswarm/config
+        read_only: true
+      - type: tmpfs
+        target: /ledger
+        tmpfs:
+          size: 2147483648
+      - *tmp
+    depends_on:
+      keygen:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${KSWARM_VALIDATOR_RPC_PORT:-38899}:8899"
+    ulimits:
+      nofile:
+        soft: 1000000
+        hard: 1000000
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 6g
+    healthcheck:
+      test: ["CMD", "solana", "-u", "http://127.0.0.1:8899", "block-height"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  # --- both profiles: artifacts ------------------------------------------------------
+  ipfs:
+    image: ipfs/kubo:v0.40.1@sha256:9c70a3dba0b5f362bf99317a02384a194f5c91cf5388abdb8fe7d64d83dd20bb
+    restart: unless-stopped
+    user: "1000:100"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    logging: *logging
+    environment:
+      IPFS_TELEMETRY: "off"
+      IPFS_PROFILE: ${KSWARM_IPFS_PROFILE:-server}
+    volumes:
+      - type: volume
+        source: ipfs-data
+        target: /data/ipfs
+      - *tmp
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+    healthcheck:
+      test: ["CMD", "ipfs", "--api", "/ip4/127.0.0.1/tcp/5001", "id"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # --- local profile: bootstrap and daemons ----------------------------------------
+  bootstrap:
+    <<: *hardened
+    profiles: [local]
+    restart: "no"
+    image: ${KSWARM_IMAGE_PREFIX:-kswarm}/cli:${KSWARM_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: docker/swarm/Dockerfile
+      target: cli
+      args: *build-args
+    command:
+      - swarm
+      - bootstrap
+      - --branch-worker
+      - ${KSWARM_BRANCH_WORKER_WALLET:-worker-a}
+      - --verifier
+      - ${KSWARM_VERIFIER_WALLET:-verifier}
+      - --aggregator
+      - ${KSWARM_AGGREGATOR_WALLET:-aggregator}
+      - --fund-kai
+      - ${KSWARM_BOOTSTRAP_FUND_KAI:-300000}
+    environment:
+      <<: *swarm-env
+      KSWARM_AGGREGATE_IMAGE_ID: ${KSWARM_AGGREGATE_IMAGE_ID:-}
+    volumes:
+      - *config-volume-rw
+      - *tmp
+    depends_on:
+      validator:
+        condition: service_healthy
+
+  branch-worker:
+    <<: *branch-worker
+    profiles: [local]
+    volumes:
+      - *config-volume-ro
+      - *tmp
+    depends_on:
+      ipfs:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+
+  verifier-worker:
+    <<: *verifier-worker
+    profiles: [local]
+    volumes:
+      - *config-volume-ro
+      - *tmp
+    depends_on:
+      ipfs:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+
+  aggregator-runner:
+    <<: *aggregator-runner
+    profiles: [local]
+    volumes:
+      - *config-volume-ro
+      - *runs-volume
+      - *tmp
+    depends_on:
+      ipfs:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+
+  # --- devnet profile: external RPC and mint, operator wallets ------------------------
+  bootstrap-devnet:
+    <<: *hardened
+    profiles: [devnet]
+    restart: "no"
+    image: ${KSWARM_IMAGE_PREFIX:-kswarm}/cli:${KSWARM_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: docker/swarm/Dockerfile
+      target: cli
+      args: *build-args
+    command:
+      - swarm
+      - bootstrap
+      - --branch-worker
+      - ${KSWARM_BRANCH_WORKER_WALLET:-worker-a}
+      - --verifier
+      - ${KSWARM_VERIFIER_WALLET:-verifier}
+      - --aggregator
+      - ${KSWARM_AGGREGATOR_WALLET:-aggregator}
+      - --payment-mint
+      - ${KSWARM_PAYMENT_MINT:-}
+      - --no-create-wallets
+      - --no-create-mint
+      - --airdrop-sol
+      - "0"
+      - --fund-kai
+      - ""
+    environment:
+      <<: *swarm-env
+      KSWARM_CLUSTER: ${KSWARM_CLUSTER:-devnet}
+      KSWARM_RPC_URL: ${KSWARM_RPC_URL:-https://api.devnet.solana.com}
+      KSWARM_AGGREGATE_IMAGE_ID: ${KSWARM_AGGREGATE_IMAGE_ID:-}
+    volumes:
+      - *config-volume-rw
+      - *wallets-bind
+      - *tmp
+
+  branch-worker-devnet:
+    <<: *branch-worker
+    profiles: [devnet]
+    environment:
+      <<: *branch-worker-env
+      KSWARM_CLUSTER: ${KSWARM_CLUSTER:-devnet}
+      KSWARM_RPC_URL: ${KSWARM_RPC_URL:-https://api.devnet.solana.com}
+    volumes:
+      - *config-volume-ro
+      - *wallets-bind
+      - *tmp
+    depends_on:
+      ipfs:
+        condition: service_healthy
+      bootstrap-devnet:
+        condition: service_completed_successfully
+
+  verifier-worker-devnet:
+    <<: *verifier-worker
+    profiles: [devnet]
+    environment:
+      <<: *verifier-worker-env
+      KSWARM_CLUSTER: ${KSWARM_CLUSTER:-devnet}
+      KSWARM_RPC_URL: ${KSWARM_RPC_URL:-https://api.devnet.solana.com}
+    volumes:
+      - *config-volume-ro
+      - *wallets-bind
+      - *tmp
+    depends_on:
+      ipfs:
+        condition: service_healthy
+      bootstrap-devnet:
+        condition: service_completed_successfully
+
+  aggregator-runner-devnet:
+    <<: *aggregator-runner
+    profiles: [devnet]
+    environment:
+      <<: *aggregator-runner-env
+      KSWARM_CLUSTER: ${KSWARM_CLUSTER:-devnet}
+      KSWARM_RPC_URL: ${KSWARM_RPC_URL:-https://api.devnet.solana.com}
+    volumes:
+      - *config-volume-ro
+      - *wallets-bind
+      - *runs-volume
+      - *tmp
+    depends_on:
+      ipfs:
+        condition: service_healthy
+      bootstrap-devnet:
+        condition: service_completed_successfully
+
+  # --- operator CLI (docker compose run --rm cli ...) --------------------------------
+  cli:
+    <<: *hardened
+    profiles: [tools]
+    restart: "no"
+    image: ${KSWARM_IMAGE_PREFIX:-kswarm}/cli:${KSWARM_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: docker/swarm/Dockerfile
+      target: cli
+      args: *build-args
+    environment:
+      <<: *swarm-env
+      KSWARM_AGGREGATE_IMAGE_ID: ${KSWARM_AGGREGATE_IMAGE_ID:-}
+    volumes:
+      - *config-volume-rw
+      - *runs-volume
+      - *tmp
+
+volumes:
+  cli-config:
+  predict-runs:
+  ipfs-data:

@@ -1,0 +1,24 @@
+[package]
+name = "bonsol-callback-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+base64 = "0.22"
+blake3 = "=1.8.2"
+bs58 = "0.5"
+flatbuffers = "24.3.25"
+hex = "0.4"
+mirofish_bonsol_branch_reducer = { path = "../bonsol-branch-reducer" }
+risc0-zkvm = { version = "=3.0.3", default-features = false }
+ruint = { version = "=1.17.0", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+solana-client = "2.3.6"
+solana-sdk = "2.3.1"
+spl-associated-token-account = "6.0.0"
+spl-token = { version = "7.0.0", features = ["no-entrypoint"] }
+spl-token-2022 = "6.0.0"

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.hypothesis/
+
+# Node
+node_modules/
+
+# Rust
+target/
+/protocol/*/target/
+
+# Docs build
+/site/
+
+# Runtime state, container volumes, local wallets: never commit these
+/runtime/
+/secrets/
+/test-ledger/
+
+# Editor and OS noise
+.DS_Store
+*.swp

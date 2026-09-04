@@ -1,0 +1,26 @@
+{
+  "name": "kswarm-protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "api": "node src/api.mjs",
+    "bootstrap:local-mint": "node scripts/bootstrap-local-mint.mjs",
+    "cancel": "node scripts/cancel-open-job.mjs",
+    "example:swarm": "node scripts/example-swarm-plan.mjs",
+    "keygen": "node scripts/create-runtime-keypair.mjs",
+    "settle": "node scripts/settle-job.mjs",
+    "slash:stale": "node scripts/slash-stale-job.mjs",
+    "stake:withdraw": "node scripts/withdraw-unlocked-stake.mjs",
+    "state": "node scripts/show-eval-state.mjs",
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "watcher": "node scripts/run-watcher.mjs"
+  },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.13",
+    "@solana/web3.js": "^1.98.2",
+    "express": "^4.21.2",
+    "multer": "^1.4.5-lts.1",
+    "tweetnacl": "^1.0.3"
+  }
+}

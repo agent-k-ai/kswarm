@@ -1,0 +1,24 @@
+[package]
+name = "method"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+# risc0 is pinned to =3.0.3 everywhere (Bonsol and the on-chain-facing crates
+# use the same version). The transitive risc0 crates are held in Cargo.lock at
+# the set from the upstream risc0 v3.0.3 lockfile (risc0-circuit-* 4.0.2,
+# risc0-zkp/binfmt/groth16 3.0.2, risc0-zkvm-platform 2.2.0). Newer 3.0.x and
+# 4.0.x point releases change the SyscallContext trait and break the `prove`
+# feature of risc0-zkvm 3.0.3. Do not `cargo update` these crates on their own.
+#
+# The guest ELF is built by `risc0-build` with the rzup risc0 Rust toolchain,
+# which is 1.88.0 for the 3.0.3 line (see docker/protocol-node/Dockerfile).
+# `ruint` and `enum-ordinalize`/`-derive` are therefore held below the versions
+# that raised their MSRV past it: ruint 1.20.0 needs rustc 1.90 and
+# enum-ordinalize 4.4.2 needs 1.89, and the guest build fails outright on both.
+# Raise them only together with the rzup Rust toolchain.
+risc0-zkvm = { version = "=3.0.3", default-features = false, features = ["std"] }
+serde = { version = "1.0", features = ["derive"] }
+sha2 = { version = "0.10", default-features = false }

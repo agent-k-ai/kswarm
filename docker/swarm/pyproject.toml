@@ -1,0 +1,28 @@
+# Runtime manifest for the swarm container images (docker/swarm/Dockerfile).
+#
+# It pins, through uv.lock, everything the four images install: the CLI, the
+# worker daemons, and their third-party dependencies. The MiroFish backend is
+# deliberately absent: the images copy backend/app/protocol and
+# backend/app/utils/llm_client.py (plus app/config.py) onto PYTHONPATH instead
+# of installing the Flask/OASIS engine. Re-lock with:
+#
+#   cd docker/swarm && uv lock
+[project]
+name = "kswarm-runtime"
+version = "0.1.0"
+description = "Locked runtime for the kswarm container images"
+requires-python = ">=3.12,<3.13"
+license = { text = "AGPL-3.0" }
+dependencies = [
+    "kswarm-cli",
+    "kswarm-worker",
+]
+
+[tool.uv]
+package = false
+
+# Editable, like worker/pyproject.toml declares its own cli dependency; the images
+# keep the sources under /opt/kswarm/src so the venv can point at them.
+[tool.uv.sources]
+kswarm-cli = { path = "../../cli", editable = true }
+kswarm-worker = { path = "../../worker", editable = true }

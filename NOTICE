@@ -1,0 +1,69 @@
+kswarm
+Copyright 2026 kswarm contributors
+
+This product includes software developed as the MiroFish multi-agent simulation
+engine, https://github.com/666ghj/MiroFish, which is licensed under the GNU
+Affero General Public License, version 3.
+
+kswarm is a derivative work of that engine and is therefore distributed under
+the same licence. See LICENSE.
+
+
+## The engine is not re-published here
+
+The engine is referenced as a git submodule at `engine/`, pinned to the upstream
+commit this tree is built against:
+
+    repository  https://github.com/666ghj/MiroFish
+    commit      db1bc144ff97a52e728f5ef54dfdc97c0c4ca953
+    date        2026-05-24
+
+At that commit the engine trees `backend/`, `frontend/`, `static/` and
+`locales/` are byte-identical to the private source tree this repository is
+exported from, apart from the files listed below.
+
+Initialise it with:
+
+    git submodule update --init engine
+
+
+## Vendored engine files
+
+The worker daemons import four modules from the engine at run time. Rather than
+require the whole Flask/OASIS/Zep application to be installed, this repository
+vendors exactly the subset the container images copy onto `PYTHONPATH`. Those
+files are:
+
+| Path in this repository | Origin | Licence |
+|---|---|---|
+| `backend/app/__init__.py` | MiroFish, modified | AGPL-3.0 |
+| `backend/app/config.py` | MiroFish, unmodified | AGPL-3.0 |
+| `backend/app/utils/llm_client.py` | MiroFish, modified | AGPL-3.0 |
+| `backend/app/utils/__init__.py` | empty file created by this export | — |
+| `backend/app/protocol/` | kswarm, original work | AGPL-3.0 |
+
+The modifications, relative to the upstream commit pinned above:
+
+- `backend/app/__init__.py` — the Flask, config and logger imports move inside
+  `create_app()` so that `app.protocol` and `app.utils.llm_client` can be
+  imported by a worker daemon without Flask installed.
+- `backend/app/utils/llm_client.py` — deterministic completion parameters, a
+  guard for a `None` message body returned by some OpenAI-compatible servers,
+  and a version hash over the endpoint and model name.
+
+Two further engine files are modified in the source tree and are **not** vendored
+here, because nothing in this repository imports them:
+`backend/app/services/__init__.py` and `backend/app/services/simulation_runner.py`.
+Both changes make package-level imports lazy for the same reason as
+`backend/app/__init__.py`.
+
+
+## Other components
+
+- The Bonsol callback parsing in `solana/` (published separately as
+  `kswarm-protocol`) is hand-rolled and imports nothing from Bonsol.
+- The Solana program itself is published under Apache-2.0 at
+  https://github.com/agent-k-ai/kswarm-protocol; it imports nothing from the
+  engine.
+- Third-party Python, Rust and Node dependencies keep their own licences; see
+  the lockfiles.

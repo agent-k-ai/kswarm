@@ -1,0 +1,124 @@
+# Unit suites for the Python and Node stacks. The secret gate runs first:
+# nothing is tested on a tree that carries key material. The `integration`
+# tests need a validator, an IPFS node, a built program and an LLM endpoint,
+# so they are excluded here and run on hosts that have them.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  secrets:
+    name: Key-material gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Self-test the scanner
+        run: scripts/check-no-secrets.sh --self-test
+      - name: Scan the index
+        run: scripts/check-no-secrets.sh
+
+  cli:
+    name: CLI unit tests
+    needs: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Install
+        working-directory: cli
+        run: uv sync --locked --group dev
+
+      # The CLI hand-encodes every instruction and decodes every account, and
+      # `tests/test_program_layout.py` asserts those encoders against the program
+      # source. The program lives in its own repository, so check it out and put
+      # `lib.rs` where the tests look for it; without this the layout tests skip
+      # themselves and the encoders go unchecked.
+      - name: Check out the program source
+        uses: actions/checkout@v4
+        with:
+          repository: agent-k-ai/kswarm-protocol
+          path: .kswarm-protocol
+      - name: Place the program source
+        run: |
+          set -euo pipefail
+          src=.kswarm-protocol/solana/programs/kswarm_protocol/src/lib.rs
+          test -f "${src}"
+          mkdir -p solana/programs/kswarm_protocol/src
+          cp "${src}" solana/programs/kswarm_protocol/src/lib.rs
+
+      # Encoder and account layouts asserted against the program source, Bonsol
+      # binding vectors, run-manifest logic, command flows against a fake chain.
+      - name: Test
+        working-directory: cli
+        run: uv run --locked pytest -q -m "not integration"
+
+      # The layout tests skip themselves when the program source is absent, so
+      # a green run proves nothing on its own. Fail if any of them skipped.
+      - name: Assert the layout tests ran
+        working-directory: cli
+        run: |
+          set -euo pipefail
+          out="$(uv run --locked pytest -q tests/test_program_layout.py)"
+          printf '%s\n' "${out}"
+          case "${out}" in
+            *skipped*) echo "::error::the program layout tests skipped; the program source was not placed"; exit 1 ;;
+          esac
+
+  worker:
+    name: Worker unit tests
+    needs: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Install
+        working-directory: worker
+        run: uv sync --group dev
+      # The daemons import `app.protocol.*` and `app.utils.llm_client` from the
+      # vendored engine subset at the repository root; see NOTICE.
+      - name: Test
+        working-directory: worker
+        run: PYTHONPATH="${GITHUB_WORKSPACE}/backend" uv run pytest -q -m "not integration"
+
+  node:
+    name: Node control-plane tests
+    needs: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install
+        working-directory: protocol
+        run: npm install --no-package-lock --no-audit --no-fund
+      - name: Syntax-check every module and script
+        working-directory: protocol
+        run: node --check src/*.mjs && node --check scripts/*.mjs
+      # One directory and one glob, so this job and `npm test` cannot run
+      # different halves of the suite.
+      - name: Test
+        working-directory: protocol
+        run: node --test "test/**/*.test.mjs"

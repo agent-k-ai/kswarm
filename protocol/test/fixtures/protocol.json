@@ -1,0 +1,14 @@
+{
+  "artifactGatewayUrl": "http://protocol-api:7001",
+  "paymentDecimals": 6,
+  "paymentMint": "CZHcDHQZerSch8Fhhi2KgV4cLiD2KtdwjJBrb8fypump",
+  "programId": "ERNzRcYhX6UYboXAAP7vwzbCKsULYu21R4RFNvDD8CkM",
+  "rpcUrl": "http://solana-validator:8899",
+  "stakeFloors": {
+    "tierOne": "50000000000",
+    "tierThree": "1000000000000",
+    "tierTwo": "250000000000",
+    "verifier": "100000000000"
+  },
+  "tokenProgramId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+}

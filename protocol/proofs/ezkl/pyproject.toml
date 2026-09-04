@@ -1,0 +1,15 @@
+[project]
+name = "kswarm-ezkl-proofs"
+version = "0.1.0"
+description = "EZKL branch proof scripts and the proof-to-claim binding check"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

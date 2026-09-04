@@ -1,0 +1,71 @@
+site_name: kswarm
+site_description: Operator and community documentation for the kswarm prediction swarm
+repo_url: https://github.com/agent-k-ai/kswarm
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+  palette:
+    - scheme: default
+      primary: teal
+      accent: amber
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: teal
+      accent: amber
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+plugins:
+  - search
+  - mermaid2
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - pymdownx.details
+  - pymdownx.highlight
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:mermaid2.fence_mermaid_custom
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Community:
+      - Community Overview: community-overview.md
+      - User Community Guide: community-guide.md
+  - Hands-On:
+      - Operator Quickstart: operator-quickstart.md
+      - Containers: containers.md
+      - CLI Reference: cli-reference.md
+      - Development Infrastructure: dev-infrastructure.md
+      - Protocol Eval Runbook: protocol-eval-runbook.md
+  - Architecture:
+      - Overview: architecture-overview.md
+      - KAI Payment Token: kai-payment-token.md
+      - Proof Layer Status: proof-layer-status.md
+      - LLM Bridge: llm-bridge-architecture.md
+      - LLM Bridge Honest Limits: llm-bridge-honest-limits.md
+      - Foundation Prototype: protocol-foundation-prototype.md
+      - Node Requirements: node-requirements-matrix.md
+  - Security:
+      - Remediation Spec: protocol-security-remediation-spec.md
+  - Testing:
+      - Testing Strategy: testing-strategy.md
+      - Bonsol Callback Findings: phase0-bonsol-callback-findings.md

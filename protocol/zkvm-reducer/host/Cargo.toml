@@ -1,0 +1,19 @@
+[package]
+name = "host"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.22"
+bincode = "1.3"
+methods = { path = "../methods" }
+# risc0 is pinned to =3.0.3 everywhere (Bonsol and the on-chain-facing crates
+# use the same version). The transitive risc0 crates are held in Cargo.lock at
+# the set from the upstream risc0 v3.0.3 lockfile (risc0-circuit-* 4.0.2,
+# risc0-zkp/binfmt/groth16 3.0.2, risc0-zkvm-platform 2.2.0). Newer 3.0.x and
+# 4.0.x point releases change the SyscallContext trait and break the `prove`
+# feature of risc0-zkvm 3.0.3. Do not `cargo update` these crates on their own.
+risc0-zkvm = { version = "=3.0.3", features = ["prove"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

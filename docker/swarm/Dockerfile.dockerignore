@@ -1,0 +1,20 @@
+# Context allowlist for docker/swarm/Dockerfile (BuildKit reads the ignore file
+# named after the Dockerfile). Everything is excluded unless listed here, so
+# keypairs, runtime state, the Node stack, and the Flask app never enter the
+# build context.
+*
+!cli/
+!worker/
+!backend/app/__init__.py
+!backend/app/config.py
+!backend/app/protocol/
+!backend/app/utils/llm_client.py
+!docker/swarm/pyproject.toml
+!docker/swarm/uv.lock
+# Never needed inside an image.
+**/__pycache__/
+**/*.pyc
+**/.venv/
+**/.pytest_cache/
+**/tests/
+cli/uv.lock

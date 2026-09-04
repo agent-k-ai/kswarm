@@ -1,0 +1,62 @@
+[project]
+name = "kswarm-worker"
+version = "0.1.0"
+description = "Branch, verifier, and aggregate runners for kswarm jobs"
+requires-python = ">=3.11,<3.13"
+license = { text = "AGPL-3.0" }
+authors = [
+    { name = "kswarm Team" }
+]
+# The daemons import `app.protocol.*` and `app.utils.llm_client` from the
+# MiroFish engine. This repository vendors exactly those modules under
+# `backend/`; see NOTICE. The base dependencies list what they need directly:
+# openai and python-dotenv.
+dependencies = [
+    "asyncpg>=0.30.0",
+    "httpx>=0.27.0",
+    "kswarm-cli",
+    "openai>=1.0.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "typer>=0.12.0",
+]
+
+# OASIS simulation branches need the full MiroFish engine, which this repository
+# does not vendor. Initialise the `engine/` submodule and install it:
+#   git submodule update --init engine
+#   uv pip install -e engine/backend
+
+[project.scripts]
+kswarm-branch-worker = "branch_worker.cli:main"
+kswarm-verifier-worker = "verifier_worker.cli:main"
+kswarm-aggregator-runner = "aggregator_runner.cli:main"
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.100.0",
+    # The vendored engine subset under `backend/` ships an empty
+    # `app/utils/__init__.py`, so `import app.utils.llm_client` works with
+    # `PYTHONPATH=backend` and does not pull in Flask. Run the suite as:
+    #   PYTHONPATH="${PWD}/../backend" uv run pytest
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[tool.uv.sources]
+kswarm-cli = { path = "../cli", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["branch_worker", "verifier_worker", "aggregator_runner", "worker_common"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "asyncio: async integration tests",
+    "slow: runs the full local protocol and Bonsol-style demo path",
+    "integration: needs Docker, a program artifact, and an LLM endpoint (scripts/swarm-smoke.sh)",
+]

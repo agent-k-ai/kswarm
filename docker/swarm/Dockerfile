@@ -28,24 +28,17 @@ FROM ${UV_IMAGE} AS uv
 # binary, and the guest ELF is compiled into it by `risc0-build`, so the image carries
 # the program it is pinned to rather than fetching one.
 #
-# Every RISC Zero component is pinned to an exact version. `rzup install` with no
-# version installs the newest of each, and that is how a guest image id moves without a
-# source change: the id is a property of the compiled ELF, so the toolchain is part of
-# the proof, not a build detail. These four versions and `protocol/zkvm-reducer/IMAGE_ID`
-# are one unit; the build fails below if they stop agreeing.
+# Nothing about the guest's compiler, or about where it is compiled, is written in this
+# file. `protocol/risc0-toolchain.env` declares both; `scripts/install-risc0-toolchain.sh`
+# installs the one and `scripts/build-zkvm-guest.sh` enforces the other, and
+# `docker/protocol-node/Dockerfile` calls the same two scripts. That is what makes the id
+# this stage produces the id that image produces. While the values lived in the two
+# Dockerfiles the builds compiled identical source at different absolute paths and under
+# different `$HOME`s, and got different image ids; the guest embeds both in its panic
+# locations (`protocol/zkvm-reducer/IMAGE_ID.md`).
 FROM ${RUST_IMAGE} AS zkvm-builder
 
-ARG RISC0_RUST_VERSION=1.88.0
-ARG RISC0_CPP_VERSION=2024.1.5
-ARG RISC0_R0VM_VERSION=3.0.3
-ARG RISC0_CARGO_RISCZERO_VERSION=3.0.3
-
-# `protocol/zkvm-reducer/rust-toolchain.toml` asks for `stable`, which makes rustup try
-# to update the toolchain this image already pins. The host build uses the image's
-# toolchain; `risc0-build` clears this variable and calls the risc0 `rustc` by path for
-# the guest, so the guest is unaffected.
-ENV RUSTUP_TOOLCHAIN=1.90.0 \
-    CARGO_TERM_COLOR=never \
+ENV CARGO_TERM_COLOR=never \
     PATH=/root/.risc0/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -56,40 +49,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -L https://risczero.com/install | bash \
-    && rzup install rust "${RISC0_RUST_VERSION}" \
-    && rzup install cpp "${RISC0_CPP_VERSION}" \
-    && rzup install r0vm "${RISC0_R0VM_VERSION}" \
-    && rzup install cargo-risczero "${RISC0_CARGO_RISCZERO_VERSION}" \
-    && rzup show
+COPY protocol/risc0-toolchain.env /build/protocol/risc0-toolchain.env
+COPY scripts/install-risc0-toolchain.sh scripts/build-zkvm-guest.sh /build/scripts/
+RUN /build/scripts/install-risc0-toolchain.sh
 
 # The shared reducer crate is a path dependency of both the guest and the host, so one
 # definition of the journal layout reaches guest, host and the Python daemons alike.
-COPY protocol/bonsol-aggregate-reducer /src/protocol/bonsol-aggregate-reducer
-COPY protocol/zkvm-reducer /src/protocol/zkvm-reducer
-
-WORKDIR /src/protocol/zkvm-reducer
-RUN cargo build --release --locked -p host
-
-# The id this build produced must be the id the repository pins, or a verifier running
-# this image would refuse every receipt a worker running it produced.
 #
 # `IMAGE_ID` sits inside the copied crate, so editing it invalidates the build layer
-# above. That is the right trade: the pin changes when the guest changes, and when the
+# below. That is the right trade: the pin changes when the guest changes, and when the
 # guest changes the guest has to be rebuilt anyway. Only reconciling the pin without a
 # source change pays for a rebuild it did not need, and that happens once.
-RUN set -eu; \
-    mkdir -p /out/bin /out/share; \
-    install -m 0755 target/release/host /out/bin/kswarm-zkvm-reducer; \
-    built="$(/out/bin/kswarm-zkvm-reducer image-id)"; \
-    pinned="$(tr -d '[:space:]' < IMAGE_ID)"; \
-    if [ "${built}" != "${pinned}" ]; then \
-      echo "guest image id drift: built ${built}, protocol/zkvm-reducer/IMAGE_ID pins ${pinned}" >&2; \
-      echo "the pinned RISC Zero components or the guest source changed; see protocol/zkvm-reducer/IMAGE_ID.md" >&2; \
-      exit 1; \
-    fi; \
-    printf '%s\n' "${built}" > /out/share/kswarm-zkvm-image-id; \
-    echo "branch canonicalization guest image id ${built}"
+COPY protocol/bonsol-aggregate-reducer /build/protocol/bonsol-aggregate-reducer
+COPY protocol/zkvm-reducer /build/protocol/zkvm-reducer
+
+# Builds the guest, asserts the id against `protocol/zkvm-reducer/IMAGE_ID`, and fails
+# the build when they differ: a verifier running this image would otherwise refuse every
+# receipt a worker running it produced.
+RUN /build/scripts/build-zkvm-guest.sh /build /out
 
 # --- builder: locked virtualenv ------------------------------------------------
 FROM ${PYTHON_IMAGE} AS builder

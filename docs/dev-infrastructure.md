@@ -122,7 +122,7 @@ Base images are pinned by digest with the tag in a comment. To move a pin, resol
 docker buildx imagetools inspect node:22-bookworm | grep -m1 Digest
 ```
 
-Toolchains inside the images are pinned too: `docker/protocol-node` installs every `rzup` component by name and version (rust 1.88.0, cpp 2024.1.5, cargo-risczero 3.0.3, r0vm 3.0.3, the risc0 3.0.3 line the Bonsol path uses) and `ezkl==23.0.5`. An unpinned `rzup install` would take the latest of each component.
+Toolchains inside the images are pinned too, and pinned in one place: `protocol/risc0-toolchain.env` declares every `rzup` component by name and version (rust 1.88.0, cpp 2024.1.5, cargo-risczero 3.0.3, r0vm 3.0.3, the risc0 3.0.3 line the Bonsol path uses), and `docker/protocol-node`, `docker/swarm` and `docker/bonsol-eval` install exactly those through `scripts/install-risc0-toolchain.sh`. An unpinned `rzup install` would take the latest of each component; four versions repeated in three Dockerfiles would drift the moment one was edited.
 
 ## IPFS Configuration
 

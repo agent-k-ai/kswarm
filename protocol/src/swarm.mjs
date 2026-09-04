@@ -6,8 +6,10 @@ export const BRANCH_KIND = {
   verify: "verify"
 };
 
+// The only proof lane this planner can require is the zkVM one. There is no
+// per-branch model proof in kswarm and no released prover could produce one for
+// the branch model; see docs/proof-layer-status.md.
 export const PROOF_SYSTEM = {
-  ezkl: "ezkl",
   none: "none",
   zkvm: "zkvm"
 };
@@ -84,7 +86,6 @@ export function buildChildReceiptManifest({
   inputHash,
   outputCid,
   outputHash,
-  ezklProof = null,
   zkvmReceipt = null
 }) {
   if (!childJob?.childJobId) {
@@ -107,7 +108,6 @@ export function buildChildReceiptManifest({
     outputHash,
     parentRequestId: childJob.parentRequestId,
     proofBundle: {
-      ezkl: buildProofDescriptor(PROOF_SYSTEM.ezkl, ezklProof),
       zkvm: buildProofDescriptor(PROOF_SYSTEM.zkvm, zkvmReceipt)
     },
     role: childJob.kind,
@@ -150,7 +150,6 @@ function normalizeBranchTemplate(branch, index) {
   return {
     branchKey,
     deterministicReducer: branch.deterministicReducer !== false,
-    ezklModelDigest: branch.ezklModelDigest || null,
     highValue: Boolean(branch.highValue),
     requiredStakeMultiplier: branch.requiredStakeMultiplier || 1,
     scenarioLabel: branch.scenarioLabel || branchKey,
@@ -215,7 +214,6 @@ function buildAggregateChildJob(parentRequest, childJobs) {
     kind: BRANCH_KIND.aggregate,
     parentRequestId: parentRequest.parentRequestId,
     proofRequirements: {
-      ezkl: null,
       zkvm: {
         programDigest: aggregateProgramDigest,
         required: true
@@ -229,12 +227,6 @@ function buildAggregateChildJob(parentRequest, childJobs) {
 
 function buildProofRequirements(branch) {
   return {
-    ezkl: branch.ezklModelDigest
-      ? {
-          modelDigest: branch.ezklModelDigest,
-          required: true
-        }
-      : null,
     zkvm: branch.deterministicReducer
       ? {
           programDigest: branch.zkvmProgramDigest || "deterministic-reducer-v1",

@@ -66,8 +66,8 @@ describe("manifestClaim score_hex", () => {
       branch_key: "b",
       child_job_id: "c",
       parent_request_id: "p",
-      result: { branch_key: "b", child_job_id: "c", parent_request_id: "p", line_count: 1, word_count: 2 },
-      proofs: { ezkl: { score_hex: MODULUS_FELT } }
+      result: { branch_key: "b", child_job_id: "c", parent_request_id: "p", line_count: 1, word_count: 2, score_hex: MODULUS_FELT },
+      proofs: {}
     };
     rejects(() => manifestClaim(manifest), /not reduced/);
   });

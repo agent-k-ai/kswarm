@@ -2,6 +2,36 @@
 
 Phase 0e proves the protocol bridge path, not a complete launch threat model.
 
+## The LLM Step Is Not Proven, And Nothing In 2026 Proves It
+
+Everything else on this page describes how far the *economic* guarantee stretches. It is
+worth being blunt about why an economic guarantee is what secures this step at all.
+
+No zero-knowledge proof system, in 2026, can prove that a language model of this size
+produced a particular output from a particular prompt. The largest language model anyone
+can prove with released code is GPT-2 small at **124M parameters**, and the fastest
+published figure for it is at a **16-token sequence**, which is not a useful input
+length. kswarm's branch model is roughly **25 times larger**. Every prover that can reach
+even that size is published under a proprietary, **evaluation-only** licence tied to the
+vendor's own proving network, so none of them could be shipped in a worker image or run
+without reintroducing a trusted third party. General-purpose zkVMs are further away, not
+closer: a transformer forward pass costs on the order of a billion cycles per token
+inside one.
+
+So the branch LLM step is secured by **verifier re-execution and slashing**, and the
+strength of that rests entirely on the determinism measured below -- on one model, one
+quantization and one prompt family.
+
+What *is* proven runs and is described in [Proof Layer Status](proof-layer-status.md):
+the aggregate reduction, gated on chain through Bonsol, and the branch canonicalization
+receipt, verified off chain before a verifier will attest.
+
+If a model proof is ever added here, it will use **public weights** with their hash
+committed on chain. A valid proof of inference over *private* weights does not establish
+that the declared model ran -- a prover can declare an architecture and parameter count
+while embedding structured weights that collapse the real computation (Hollow-LLM,
+IEEE S&P 2026) -- and weight privacy is a feature this protocol does not need.
+
 ## LLM Determinism
 
 Local LLM inference can diverge even with `temperature=0` and a fixed seed. Phase 0e handles this honestly by snapping scalar outputs to basis points. The verifier re-executes the whole branch and compares its own canonical commitment with the worker's receipt. If an honest worker and honest verifier land in different buckets, the verifier attestation hash differs and the challenge path fires -- for the verifier assigned to that job.
@@ -84,6 +114,14 @@ Known gaps:
 
 ## Deferred Work
 
-EZKL DistilBERT per-branch risk scoring is not part of Phase 0e. It remains Phase 2 work.
+A per-branch proof of a model -- the DistilBERT risk-scorer lane sketched for Phase 2 --
+is not deferred so much as blocked. The plan assumed a hidden dimension of 768, which the
+proving toolkit it named is measured to run out of memory on, on a 128 GB machine; the
+systems that can prove a 124M-parameter model are licensed for evaluation only. Nothing
+in the tree stands in for that lane. The two-feature linear placeholder that used to
+carry the name was removed on 2026-09-04, because a proof of
+`2 * line_count + 3 * word_count + 1` says nothing about a forecast, and because the
+package that produced it ships with no licence file while its documentation asserts that
+commercial use requires one.
 
 Domain-specific narrative merging, ranked-list combiners, image combiners, and LLM-as-judge cryptographic lanes are not part of Phase 0e.

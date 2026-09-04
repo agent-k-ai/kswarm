@@ -4,13 +4,12 @@
 // values to the result the manifest claims. Every check fails closed: a
 // missing field, a wrong type, or a mismatch throws ProofBindingError.
 //
-// This module has no I/O and no dependency on the ezkl or zkvm binaries so
+// This module has no I/O and no dependency on the zkvm-reducer binary so
 // it can run under `node --test` without node_modules.
 
 import { createHash } from "crypto";
 
 export const BRANCH_OUTPUT_MANIFEST_VERSION = "kswarm-branch-output-v1";
-export const EZKL_BUNDLE_VERSION = "kswarm-ezkl-proof-v1";
 export const ZKVM_BUNDLE_VERSION = "kswarm-zkvm-receipt-v1";
 
 // Journal fields committed by protocol/zkvm-reducer/methods/guest/src/main.rs.
@@ -84,6 +83,8 @@ function isReducedLittleEndian(bytes) {
 
 // Decode a score_hex (64 lowercase hex digits, little-endian, reduced) into
 // the 32 bytes the Bonsol guest commits. bytes[0] is the least significant.
+// The encoding is a BN254 scalar field element and nothing more; no proof
+// system in this tree produces it today.
 export function decodeScoreFelt(scoreHex, label = "score_hex") {
   requireHex64(scoreHex, label, FELT_HEX_PATTERN);
   const bytes = Buffer.from(scoreHex, "hex");
@@ -132,36 +133,9 @@ export function manifestClaim(manifest) {
   requireEqual(manifest.branch_key, claim.branchKey, "manifest.branch_key");
   requireEqual(manifest.child_job_id, claim.childJobId, "manifest.child_job_id");
   requireEqual(manifest.parent_request_id, claim.parentRequestId, "manifest.parent_request_id");
-  const proofs = requireObject(manifest.proofs, "manifest.proofs");
-  const ezkl = requireObject(proofs.ezkl, "manifest.proofs.ezkl");
-  decodeScoreFelt(ezkl.score_hex, "manifest.proofs.ezkl.score_hex");
-  claim.scoreHex = ezkl.score_hex;
-  return claim;
-}
-
-// The EZKL bundle is the prover's claim about the proof instances. It must
-// state the same values the manifest states. verify_branch.py then binds the
-// proof instances to these values.
-export function bindEzklBundleToManifest({ manifest, ezklBundle }) {
-  const claim = manifestClaim(manifest);
-  const ezkl = manifest.proofs.ezkl;
-  const bundle = requireObject(ezklBundle, "ezkl bundle");
-  requireEqual(bundle.bundle_version, EZKL_BUNDLE_VERSION, "ezkl bundle.bundle_version");
-  const features = requireObject(bundle.features, "ezkl bundle.features");
-  if (typeof features.line_count !== "number" || features.line_count !== claim.lineCount) {
-    throw new ProofBindingError("ezkl bundle.features.line_count mismatch");
-  }
-  if (typeof features.word_count !== "number" || features.word_count !== claim.wordCount) {
-    throw new ProofBindingError("ezkl bundle.features.word_count mismatch");
-  }
-  requireEqual(bundle.score_hex, claim.scoreHex, "ezkl bundle.score_hex");
-  const instances = bundle.public_instances;
-  if (!Array.isArray(instances) || instances.length !== 1 || !Array.isArray(instances[0]) || instances[0].length === 0) {
-    throw new ProofBindingError("ezkl bundle.public_instances must hold one non-empty column");
-  }
-  requireEqual(instances[0][instances[0].length - 1], claim.scoreHex, "ezkl bundle.public_instances output");
-  requireEqual(bundle.proof_sha256, requireHex64(ezkl.proof_sha256, "manifest.proofs.ezkl.proof_sha256", SHA256_HEX_PATTERN), "ezkl bundle.proof_sha256");
-  requireEqual(bundle.vk_sha256, requireHex64(ezkl.vk_sha256, "manifest.proofs.ezkl.vk_sha256", SHA256_HEX_PATTERN), "ezkl bundle.vk_sha256");
+  requireObject(manifest.proofs, "manifest.proofs");
+  decodeScoreFelt(result.score_hex, "manifest.result.score_hex");
+  claim.scoreHex = result.score_hex;
   return claim;
 }
 
@@ -208,12 +182,6 @@ export function bindZkvmJournalToManifest({ manifest, verification }) {
   for (const field of ZKVM_JOURNAL_FIELDS) {
     requireEqual(recorded[field], journal[field], `manifest.proofs.zkvm.journal.${field}`);
   }
-  return { claim, journal };
-}
-
-export function bindBranchManifest({ manifest, ezklBundle, zkvmVerification }) {
-  const claim = bindEzklBundleToManifest({ manifest, ezklBundle });
-  const { journal } = bindZkvmJournalToManifest({ manifest, verification: zkvmVerification });
   return { claim, journal };
 }
 

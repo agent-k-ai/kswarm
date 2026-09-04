@@ -108,9 +108,9 @@ def framed_input_digest(payload: bytes) -> bytes:
 def decode_score_felt(score_hex: str) -> bytes:
     """`decode_score_felt` from `protocol/bonsol-branch-reducer/src/lib.rs`.
 
-    `score_hex` is the canonical EZKL instance encoding: exactly 64 lowercase hex
-    digits, no prefix, the little-endian canonical bytes of a BN254 scalar field
-    element, reduced modulo the field. The checks run in the Rust order -- every
+    `score_hex` is exactly 64 lowercase hex digits, no prefix, the little-endian
+    canonical bytes of a BN254 scalar field element, reduced modulo the field.
+    The checks run in the Rust order -- every
     byte a lowercase hex digit, then the digit count, then the reduction -- so the
     CLI reports the same reason the guest and the harness would.
 

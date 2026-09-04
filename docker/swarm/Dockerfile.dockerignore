@@ -15,6 +15,12 @@
 # reducer crate is a path dependency of both, so both directories have to enter.
 !protocol/zkvm-reducer/
 !protocol/bonsol-aggregate-reducer/
+# The one declaration of the RISC Zero component versions and of where the guest is
+# compiled, and the two scripts that read it. Every image that builds the guest goes
+# through them, so the Dockerfile holds none of those values itself.
+!protocol/risc0-toolchain.env
+!scripts/install-risc0-toolchain.sh
+!scripts/build-zkvm-guest.sh
 # Named in full rather than by a `**/target` glob: `bonsol build` leaves a root-owned
 # `target/` in the guest crates, the context sender fails on it with "permission
 # denied", and the glob did not exclude it at this depth. Nothing in `target/` belongs

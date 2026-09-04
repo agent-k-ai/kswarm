@@ -148,8 +148,20 @@ image id against `KSWARM_ZKVM_IMAGE_ID` when pinned, and binds the journal to th
 the input digest must be the frame rebuilt from this job's input and output, the result
 hash must be the on-chain `submitted_result_hash`, and the length must be the document it
 fetched. If re-execution disagrees as well, it attests to its own hash and challenges. If
-re-execution agrees but the receipt does not, it refuses to attest, and the job reaches
-its challenge deadline unsettleable.
+re-execution agrees but the receipt does not, it refuses to attest.
+
+**Refusing to attest does not stop the branch settling.** `settle_job` checks only that
+the job is `Completed`, is not an `aggregate-proof` job, and is past its challenge
+deadline, and then pays
+(`solana/programs/kswarm_protocol/src/lib.rs:563-609`). It reads neither
+`verifier_attestation_hash` nor any receipt, and there is no cancel path for a
+`Completed` branch. So this receipt is a real check with a real consequence -- an
+attestation that disagrees is challengeable and slashable, and a withheld attestation is
+visible evidence -- but it is not an on-chain settlement gate, and the aggregate path does
+not supply one either: the aggregate guest reads only receipt bytes, and neither it nor
+`settle_aggregate_proof_job` sees a branch attestation. The branch-level guarantee is
+economic and social. `docs/proof-layer-status.md`, "What the chain enforces about a
+branch", states the full position and records the open item.
 
 Proving is tens of seconds of CPU per branch, so it is opt-in per worker. A branch job
 whose execution window is shorter than the prove time would be slashed for a proof it

@@ -91,12 +91,24 @@ ensure_risc0_toolchain() {
 
 # `risc0-build` builds a guest inside `risczero/risc0-guest-builder:<tag>`, defaulting
 # to the mutable tag `r0.1.88.0`. A guest ELF is a function of its toolchain, so that
-# tag decides every image id this script produces. Pull the digest the image pins,
+# tag decides every image id this script produces. Pull the digest the repository pins,
 # retag it locally, and point `risc0-build` at the local tag.
+#
+# The digest comes from `protocol/risc0-toolchain.env` in the repository being built --
+# the one declaration every image that touches a guest reads -- so changing the pin does
+# not need the eval image rebuilt. RISC0_GUEST_BUILDER_DIGEST in the environment still
+# wins, for a one-off run against a different builder.
 pin_guest_builder() {
   digest="${RISC0_GUEST_BUILDER_DIGEST:-}"
+  toolchain_env="${repo_dir}/protocol/risc0-toolchain.env"
+  if [ -z "${digest}" ] && [ -f "${toolchain_env}" ]; then
+    # shellcheck disable=SC1090
+    . "${toolchain_env}"
+    digest="${RISC0_GUEST_BUILDER_DIGEST:-}"
+  fi
   if [ -z "${digest}" ]; then
-    echo "RISC0_GUEST_BUILDER_DIGEST is unset: guest image ids would not be reproducible" >&2
+    echo "no RISC0_GUEST_BUILDER_DIGEST in the environment or in ${toolchain_env}:" >&2
+    echo "guest image ids would not be reproducible" >&2
     exit 1
   fi
   pinned_tag="r0.1.88.0-pinned"

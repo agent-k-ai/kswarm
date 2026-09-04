@@ -21,12 +21,23 @@ The chain plumbing runs end to end on a local validator: escrow, worker stake,
 claim rights, receipts, verifier re-execution and attestation, aggregate
 settlement through a Bonsol callback, cancellation, and slashing.
 
-The trust layer is narrower than it sounds. The verifier catches a worker that
-fabricates a result by re-executing the branch, which is real. The zkVM guests
-hash the values they are handed rather than recomputing them from source text, so
-a proof says "the guest saw these values", not "these values are true". Branch
-narrative prose is hash-committed but is not checked for correctness. All of this
-is written down, with what would have to change, in
+The trust layer is narrower than it sounds, so here is the split. Two things
+carry a zero-knowledge proof: the aggregate reduction, which the Solana program
+will not pay without, and the branch canonicalization receipt, which proves the
+document a worker published is exactly the one its on-chain receipt refers to.
+Both guests recompute rather than restate the values they are given.
+
+**The language model step is not proven, and no 2026 technology proves it.** The
+largest language model anyone can prove with released code is GPT-2 small at 124
+million parameters, and the fastest published figure for it is at a 16-token
+sequence; the branch model is roughly 25 times larger, and every prover that can
+reach even that size is licensed for evaluation only and tied to its vendor's own
+proving network. That step is secured **economically**: a second staked operator
+re-runs the branch with the identical model, seed and configuration, and a worker
+whose result differs is challenged and slashed. It is not a cryptographic
+guarantee, and it rests on determinism measured on one model and one prompt
+family. Branch narrative prose is hash-committed but is not checked for
+correctness. All of this is written down, with what would have to change, in
 [docs/proof-layer-status.md](docs/proof-layer-status.md).
 
 There is no measured forecasting edge. A sealed, pre-registered test on one class
@@ -59,7 +70,7 @@ For the containerised stack (four non-root images, one compose file), see
 |---|---|
 | `worker/` | branch worker, verifier worker, aggregator runner, shared config and IPFS client |
 | `cli/` | the `kswarm` operator CLI: wallets, tokens, `predict`, settle, inspect |
-| `protocol/` | Node control plane (artifact gateway, settlement watcher), EZKL and zkVM proof tooling, the Bonsol reducer and callback harness |
+| `protocol/` | Node control plane (artifact gateway, settlement watcher), the branch canonicalization zkVM guest and host, the Bonsol aggregate reducer and the callback harness |
 | `docker/swarm/` | the four runtime images |
 | `docker/protocol-node/` | the Node and proving toolchain image; building it needs the program repository checked out at `solana/` (see below) |
 | `docker/ipfs/` | the Kubo bootstrap and peer entrypoints those images use |

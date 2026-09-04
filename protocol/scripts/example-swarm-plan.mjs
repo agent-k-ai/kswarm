@@ -10,19 +10,16 @@ const parentRequest = buildParentSwarmRequest({
     {
       branchKey: "baseline",
       scenarioLabel: "Baseline world",
-      ezklModelDigest: "onnx-risk-score-v1",
       zkvmProgramDigest: "branch-reducer-v1"
     },
     {
       branchKey: "optimistic",
       scenarioLabel: "Optimistic world",
-      ezklModelDigest: "onnx-risk-score-v1",
       zkvmProgramDigest: "branch-reducer-v1"
     },
     {
       branchKey: "pessimistic",
       scenarioLabel: "Pessimistic world",
-      ezklModelDigest: "onnx-risk-score-v1",
       zkvmProgramDigest: "branch-reducer-v1",
       highValue: true,
       verificationMode: "replicated-rerun"
@@ -30,7 +27,6 @@ const parentRequest = buildParentSwarmRequest({
     {
       branchKey: "tariff-shock",
       scenarioLabel: "Tariff shock",
-      ezklModelDigest: "onnx-policy-impact-v1",
       zkvmProgramDigest: "branch-reducer-v1",
       highValue: true
     }
@@ -48,12 +44,6 @@ const exampleReceipts = swarmPlan.childJobs
       inputHash: parentRequest.inputHash,
       outputCid: `bafy-output-${job.branchKey}`,
       outputHash: `hash-output-${job.branchKey}`,
-      ezklProof: job.proofRequirements?.ezkl
-        ? {
-            proofCid: `bafy-ezkl-${job.branchKey}`,
-            publicOutputHash: `public-output-${job.branchKey}`
-          }
-        : null,
       zkvmReceipt: job.proofRequirements?.zkvm
         ? {
             journalHash: `journal-${job.branchKey}`,

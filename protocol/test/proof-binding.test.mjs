@@ -4,20 +4,14 @@ import { describe, it } from "node:test";
 import {
   ProofBindingError,
   ZKVM_JOURNAL_FIELDS,
-  bindBranchManifest,
-  bindEzklBundleToManifest,
   bindZkvmJournalToManifest,
   computeReducerDigest,
   manifestClaim
 } from "../src/proof-binding.mjs";
 
-// Values from a real ezkl 23.0.5 run: line_count=3, word_count=17, score=58 at scale 8.
-const LINE_FELT = "0003000000000000000000000000000000000000000000000000000000000000";
-const WORD_FELT = "0011000000000000000000000000000000000000000000000000000000000000";
+// line_count=3, word_count=17, score=58 encoded as little-endian BN254 field elements.
 const SCORE_FELT = "003a000000000000000000000000000000000000000000000000000000000000";
 const OTHER_FELT = "003b000000000000000000000000000000000000000000000000000000000000";
-const PROOF_SHA = "12ce0e543cab0feef5bb6d760b71f500e124493211f41e6b6a3d03f0fe2675c2";
-const VK_SHA = "8f676d0d1124a5516413bf02286df7de8141345fe97fc31213c4101e19707462";
 const IMAGE_ID = "a1".repeat(32);
 // sha256("baseline" || "child-baseline-1" || "parent-bonsol-eval" || SCORE_FELT || le32(3) || le32(17)),
 // computed independently with Python hashlib.
@@ -35,20 +29,6 @@ function makeJournal(overrides = {}) {
     ...overrides
   };
   return journal;
-}
-
-function makeEzklBundle(overrides = {}) {
-  return {
-    bundle_version: "kswarm-ezkl-proof-v1",
-    features: { line_count: 3, word_count: 17 },
-    proof_sha256: PROOF_SHA,
-    public_instances: [[LINE_FELT, WORD_FELT, SCORE_FELT]],
-    score: 58,
-    score_hex: SCORE_FELT,
-    verified: true,
-    vk_sha256: VK_SHA,
-    ...overrides
-  };
 }
 
 function makeVerification(overrides = {}) {
@@ -74,16 +54,10 @@ function makeManifest(overrides = {}) {
       executor_version: "swarm-child-v1",
       parent_request_id: "parent-bonsol-eval",
       line_count: 3,
+      score_hex: SCORE_FELT,
       word_count: 17
     },
     proofs: {
-      ezkl: {
-        bundle_sha256: "ab".repeat(32),
-        proof_sha256: PROOF_SHA,
-        score_hex: SCORE_FELT,
-        verified: true,
-        vk_sha256: VK_SHA
-      },
       zkvm: {
         bundle_sha256: "cd".repeat(32),
         image_id_hex: IMAGE_ID,
@@ -92,8 +66,6 @@ function makeManifest(overrides = {}) {
       }
     },
     artifacts: {
-      ezkl_bundle_cid: "bafy-ezkl-bundle",
-      ezkl_proof_cid: "bafy-ezkl-proof",
       zkvm_bundle_cid: "bafy-zkvm-bundle"
     },
     ...overrides
@@ -168,46 +140,18 @@ describe("manifestClaim", () => {
 
   it("fails closed on a malformed score_hex", () => {
     const manifest = makeManifest();
-    manifest.proofs.ezkl.score_hex = "0x3a00";
+    manifest.result.score_hex = "0x3a00";
     rejects(() => manifestClaim(manifest), /score_hex/);
-    manifest.proofs.ezkl.score_hex = SCORE_FELT.toUpperCase();
+    manifest.result.score_hex = SCORE_FELT.toUpperCase();
     rejects(() => manifestClaim(manifest), /score_hex/);
-    delete manifest.proofs.ezkl.score_hex;
+    delete manifest.result.score_hex;
     rejects(() => manifestClaim(manifest), /score_hex/);
   });
-});
 
-describe("bindEzklBundleToManifest", () => {
-  it("passes when the bundle claim equals the manifest claim", () => {
-    const claim = bindEzklBundleToManifest({ manifest: makeManifest(), ezklBundle: makeEzklBundle() });
-    assert.equal(claim.scoreHex, SCORE_FELT);
-  });
-
-  it("fails on each single-field mismatch", () => {
-    rejects(() => bindEzklBundleToManifest({ manifest: makeManifest(), ezklBundle: makeEzklBundle({ features: { line_count: 4, word_count: 17 } }) }), /line_count/);
-    rejects(() => bindEzklBundleToManifest({ manifest: makeManifest(), ezklBundle: makeEzklBundle({ features: { line_count: 3, word_count: 18 } }) }), /word_count/);
-    rejects(() => bindEzklBundleToManifest({ manifest: makeManifest(), ezklBundle: makeEzklBundle({ score_hex: OTHER_FELT }) }), /score_hex/);
-    rejects(() => bindEzklBundleToManifest({ manifest: makeManifest(), ezklBundle: makeEzklBundle({ public_instances: [[LINE_FELT, WORD_FELT, OTHER_FELT]] }) }), /public_instances/);
-    rejects(() => bindEzklBundleToManifest({ manifest: makeManifest(), ezklBundle: makeEzklBundle({ proof_sha256: "00".repeat(32) }) }), /proof_sha256/);
-    rejects(() => bindEzklBundleToManifest({ manifest: makeManifest(), ezklBundle: makeEzklBundle({ vk_sha256: "00".repeat(32) }) }), /vk_sha256/);
-    rejects(() => bindEzklBundleToManifest({ manifest: makeManifest(), ezklBundle: makeEzklBundle({ bundle_version: "other" }) }), /bundle_version/);
-  });
-
-  it("fails when the manifest result differs from the bundle", () => {
-    rejects(() => bindEzklBundleToManifest({ manifest: withResult({ line_count: 2 }), ezklBundle: makeEzklBundle() }), /line_count/);
-  });
-
-  it("fails on missing bundle pieces", () => {
-    rejects(() => bindEzklBundleToManifest({ manifest: makeManifest(), ezklBundle: null }), /ezkl bundle/);
-    rejects(() => bindEzklBundleToManifest({ manifest: makeManifest(), ezklBundle: makeEzklBundle({ features: undefined }) }), /features/);
-    rejects(() => bindEzklBundleToManifest({ manifest: makeManifest(), ezklBundle: makeEzklBundle({ public_instances: [] }) }), /public_instances/);
-    rejects(() => bindEzklBundleToManifest({ manifest: makeManifest(), ezklBundle: makeEzklBundle({ public_instances: [[]] }) }), /public_instances/);
-  });
-
-  it("fails when manifest hashes are malformed", () => {
+  it("fails closed when the manifest carries no proofs section", () => {
     const manifest = makeManifest();
-    manifest.proofs.ezkl.proof_sha256 = "nope";
-    rejects(() => bindEzklBundleToManifest({ manifest, ezklBundle: makeEzklBundle() }), /proof_sha256/);
+    delete manifest.proofs;
+    rejects(() => manifestClaim(manifest), /manifest.proofs/);
   });
 });
 
@@ -276,18 +220,5 @@ describe("bindZkvmJournalToManifest", () => {
     const manifest = makeManifest();
     delete manifest.proofs.zkvm;
     rejects(() => bindZkvmJournalToManifest({ manifest, verification: makeVerification() }), /proofs.zkvm/);
-  });
-});
-
-describe("bindBranchManifest", () => {
-  it("binds both proof lanes", () => {
-    const bound = bindBranchManifest({ manifest: makeManifest(), ezklBundle: makeEzklBundle(), zkvmVerification: makeVerification() });
-    assert.equal(bound.claim.lineCount, 3);
-    assert.equal(bound.journal.reducer_digest, GOLDEN_DIGEST);
-  });
-
-  it("fails if either lane fails", () => {
-    rejects(() => bindBranchManifest({ manifest: makeManifest(), ezklBundle: makeEzklBundle({ score_hex: OTHER_FELT }), zkvmVerification: makeVerification() }), /score_hex/);
-    rejects(() => bindBranchManifest({ manifest: makeManifest(), ezklBundle: makeEzklBundle(), zkvmVerification: makeVerification({ journal: makeJournal({ word_count: 1 }) }) }), /word_count/);
   });
 });

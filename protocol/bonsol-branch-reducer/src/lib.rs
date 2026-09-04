@@ -72,10 +72,11 @@ impl std::error::Error for ScoreHexError {}
 
 /// Decode `score_hex` into the 32 bytes the guest commits.
 ///
-/// `score_hex` is the canonical EZKL instance encoding: exactly 64 lowercase
-/// hex digits, no prefix, the little-endian bytes of a BN254 scalar field
-/// element, reduced modulo the field. The returned bytes are in string order,
-/// so `bytes[0]` is the least significant byte of the score.
+/// `score_hex` is exactly 64 lowercase hex digits, no prefix, the little-endian
+/// bytes of a BN254 scalar field element, reduced modulo the field. The returned
+/// bytes are in string order, so `bytes[0]` is the least significant byte of the
+/// score. The encoding is fixed by this function and the callers that mirror it;
+/// no proving system in the tree produces or consumes it.
 ///
 /// Rules, checked in this order:
 /// - every byte must be a lowercase ASCII hex digit (`InvalidHexDigit`)

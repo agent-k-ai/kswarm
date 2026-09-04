@@ -24,10 +24,14 @@ worker is retired; see [Foundation Prototype](protocol-foundation-prototype.md).
 `branch-worker` and `verifier-worker` additionally carry the zkVM prover: the
 `zkvm-reducer` host binary at `/opt/kswarm/bin/kswarm-zkvm-reducer`, with the guest ELF
 compiled into it and that guest's image id recorded beside it at
-`/opt/kswarm/share/kswarm-zkvm-image-id`. It is built in a stage of its own from RISC
-Zero components pinned to exact versions, and the build fails if the id it produces is
-not the one `protocol/zkvm-reducer/IMAGE_ID` pins. `aggregator-runner` and `cli` do not
-carry it: neither proves anything, and it is 150 MB of attack surface.
+`/opt/kswarm/share/kswarm-zkvm-image-id`. It is built in a stage of its own by
+`scripts/build-zkvm-guest.sh`, from the RISC Zero components
+`protocol/risc0-toolchain.env` declares, and the build fails if the id it produces is not
+the one `protocol/zkvm-reducer/IMAGE_ID` pins. `docker/protocol-node` calls the same
+script, so the guest in that image is the same guest; the script, and not either
+Dockerfile, owns the build path and `$HOME`, because the id is a function of both
+(`protocol/zkvm-reducer/IMAGE_ID.md`). `aggregator-runner` and `cli` do not carry the
+binary: neither proves anything, and it is 150 MB of attack surface.
 
 The aggregate proof is a different shape. Requesting a Bonsol execution needs the Bonsol
 CLI, a funded client keypair and a docker socket, none of which belong in a hardened
@@ -210,6 +214,20 @@ repository moves the images with it; only `<registry>` is set in the workflow.
 The digests are recorded in the job summary. The registry token comes
 from the `REGISTRY_USERNAME` / `REGISTRY_PASSWORD` Actions secrets; the
 workflow prints no secret.
+
+On a pull request the job scans the git index for key material
+(`scripts/check-no-secrets.sh`, its own self-test first), builds all four
+targets, checks that every image carries this commit in
+`org.opencontainers.image.revision` and that the two proving images carry the
+guest id `protocol/zkvm-reducer/IMAGE_ID` pins, runs the images (`cli --help`,
+an import of each worker's CLI module, and the uid each one runs as), and
+renders the `local`, `devnet` and `tools` compose profiles. It pushes nothing.
+About twenty minutes with the guest built from cold.
+
+The tag path -- registry login, `docker push`, the digest summary -- has never
+executed. The `v0.1.0-devnet.1` .. `.3` tags did trigger the workflow, but all
+three runs failed at the secret scan, six steps before the login. Read those
+steps as written, not as exercised.
 
 Run a tagged release instead of building locally:
 

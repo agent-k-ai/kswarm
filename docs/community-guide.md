@@ -34,7 +34,7 @@ The Swarm Protocol turns that engine into an open network: many independent oper
 5. **Execute.** The worker runs the branch against an OpenAI-compatible chat endpoint at temperature 0 with a fixed seed, so the same input gives the same output.
 6. **Receipt.** The worker publishes the output and transcript to IPFS, then calls `submit_receipt`. The job becomes `completed` and the challenge window starts.
 7. **Verify.** A verifier re-executes the same branch with the same model and seed, then submits an attestation carrying its own result hash.
-8. **Settle or challenge.** After the challenge window, `settle_job` pays the reward and unlocks the stake. If the assigned verifier's result differs, `challenge_job` slashes the stake instead.
+8. **Settle or challenge.** After the challenge window, `settle_job` pays the reward and unlocks the stake -- whether or not a verifier attested, because settlement does not read the attestation. If the assigned verifier's result differs and it challenges inside the window, `challenge_job` slashes the stake instead.
 9. **Aggregate.** Once the branches settle you run `kswarm predict bind-aggregate <parent-run>`. That builds the aggregate input from the branch receipts the chain already accepted, works out the journal the reducer will commit, and opens the aggregate job bound to both. An aggregator then proves the reduction through Bonsol. `settle_aggregate_proof_job` pays only when the proof marker is on chain and a matching attestation exists. The aggregate job is not opened by `predict open`, because its input carries the branch receipts and those do not exist until the branches run.
 10. **Report.** `predict report` returns the aggregate value and branch narratives.
 
@@ -51,9 +51,10 @@ The chain plumbing is real and runs end to end on a local validator: escrow, sta
 | Challenge authorization | Only the verifier the customer or admin assigned may challenge. |
 | Aggregate settlement gate | Proof-gated on-chain through Bonsol. Sound, and now reached: `predict bind-aggregate` opens the aggregate job bound to the artifact its branch receipts produce. |
 | What the aggregate proof says | The guest recomputes. It rehashes every branch receipt in the artifact, decodes the branch values out of those bytes, applies the combiner with its committed parameters, and commits the result and a Merkle root over the branch hashes. Those hashes are the `submitted_result_hash` values already on chain, so anyone can check which branches were reduced. |
-| Branch receipts | A worker with `KSWARM_ZKVM_HOST` set proves that its published output document encodes to exactly the receipt it submitted, and the verifier checks that proof before it attests. This catches a worker that publishes one document and settles another, which re-execution cannot. Proving costs minutes of CPU, so it is opt-in per worker. |
-| The language model step | Not proven, and not provable today. It is secured by re-execution plus challenge and slashing: an economic guarantee, not a cryptographic one. |
-| EZKL branch proof | Research tooling, off the release path. Its model is a fixed two-input linear function that is not a submodel of anything kswarm runs. |
+| Branch receipts | A worker with `KSWARM_ZKVM_HOST` set proves that its published output document encodes to exactly the receipt it submitted, and the verifier checks that proof before it attests. This catches a worker that publishes one document and settles another, which re-execution cannot. Proving was measured at 31.9 s of CPU per branch, so it is opt-in per worker. |
+| The language model step | **Not proven, and no 2026 technology proves it.** The largest language model anyone can prove with released code is GPT-2 small at 124M parameters, the fastest published figure for it is at a 16-token sequence, and the branch model is roughly 25 times larger. Every prover that can reach even that size is licensed for evaluation only and tied to the vendor's own proving network. The step is secured by re-execution plus challenge and slashing: an economic guarantee, not a cryptographic one, resting on determinism measured on one model and one prompt family. |
+| A per-branch model proof | None, and nothing stands in for one. The two-feature linear placeholder that used to sit in the tree was removed on 2026-09-04; a proof of `2 * line_count + 3 * word_count + 1` says nothing about a forecast, and the package that produced it ships with no licence file. |
+| Branch settlement is not gated on a receipt or an attestation | Known gap. `settle_job` checks only that the job is `completed`, is not an aggregate job, and is past its challenge deadline, then pays (`solana/programs/kswarm_protocol/src/lib.rs:563-609`). A branch with no receipt, or one whose receipt does not verify, is paid unless the assigned verifier challenged in the window, and there is no cancel path for a `completed` branch. The aggregate path does not cover for it: the aggregate guest sees branch receipt bytes and no branch attestation. Branch-level protection is economic; aggregate-level protection is enforced on chain. |
 | Settle daemon | None in the Python stack. Branch jobs stay `completed` until somebody runs `kswarm settle <job>`. |
 
 ### Release path
@@ -216,7 +217,9 @@ kswarm worker stake 100000 --as verifier
 
 **Re-execution.** The daemon re-runs the branch with the same model, prompt, and seed, then compares its own canonical commitment with the worker's receipt.
 
-**Receipt verification.** With `KSWARM_ZKVM_HOST` set, the daemon also verifies the branch's zero-knowledge receipt and binds it to the job: the proof must be over this job's input and the worker's published output, and its result hash must be the one on chain. If re-execution agrees but the receipt does not, the daemon refuses to attest at all, because attesting would let the job settle on a receipt whose proof does not hold.
+**Receipt verification.** With `KSWARM_ZKVM_HOST` set, the daemon also verifies the branch's zero-knowledge receipt and binds it to the job: the proof must be over this job's input and the worker's published output, and its result hash must be the one on chain. If re-execution agrees but the receipt does not, the daemon refuses to attest at all: it will not put its name to a receipt whose proof does not hold.
+
+Refusing does not stop the job settling. `settle_job` pays a `completed` branch at its challenge deadline whether or not you attested. Withholding an attestation records that no verifier vouched for the receipt; it does not withhold the money. If you want the worker's stake, you have to be the assigned verifier and challenge inside the window.
 
 ```bash
 kswarm attest <job> --result-hash <hex> --evidence-cid <cid> \

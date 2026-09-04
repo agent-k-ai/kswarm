@@ -282,7 +282,7 @@ Bring up the control plane on Machine 1 and the worker profiles on Machines 2 an
 - stale workers can be slashed and the user refunded
 - artifacts are off-chain, but payment and state transitions are on-chain
 - one submitted request can expand into `N+` settled child jobs across the swarm
-- branch receipts can carry real proof artifacts for `EZKL` and `zkVM`
+- branch receipts can carry a real `zkVM` canonicalization proof, checked by the verifier before it attests
 
 ## 15. Current Limits
 

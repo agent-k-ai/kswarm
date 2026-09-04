@@ -72,7 +72,7 @@ That means the protocol is:
 | Role | Purpose | Must Stake | Suggested Minimum Stake | Current On-Chain Support | Future Required Checks |
 |---|---|---:|---:|---|---|
 | `worker-basic` | deterministic jobs, low-risk branch execution | Yes | `50,000 KAI` (tier one) | Yes | max claims |
-| `worker-proof` | proof-carrying branch execution with `EZKL` / `zkVM` | Yes | `250,000 KAI` (tier two) | Yes | proof mode eligibility refinement |
+| `worker-proof` | proof-carrying branch execution: the `zkVM` branch canonicalization receipt | Yes | `250,000 KAI` (tier two) | Yes | proof mode eligibility refinement |
 | `worker-premium` | high-value or replicated branch execution | Yes | `1,000,000 KAI` (tier three) | Partial | premium class rollout, higher slash exposure |
 | `verifier` | verifies proofs, challenges bad jobs | Yes | `100,000 KAI` (verifier floor) | No | verifier registry, challenger bond rules |
 | `artifact-peer` | stores and serves artifacts | Optional early, yes later | `50,000 KAI` | No | uptime/accountability checks |
@@ -85,7 +85,7 @@ That means the protocol is:
 | Job Class | Example | Minimum Node Role | Minimum Stake | Parallelism Policy | Verification Policy |
 |---|---|---|---:|---|---|
 | `deterministic-basic` | text normalization, canonical extraction | `worker-basic` | `50,000 KAI` | many claims allowed | deterministic hash checks |
-| `branch-proof` | branch execution with ONNX scorer + reducer | `worker-proof` | `250,000 KAI` | bounded by tier | `EZKL` + `zkVM` artifacts |
+| `branch-proof` | branch execution with a canonicalization receipt | `worker-proof` | `250,000 KAI` | bounded by tier | `zkVM` receipt bound to the published branch output |
 | `branch-replicated` | high-value replicated branch | `worker-premium` | `1,000,000 KAI` | low concurrency | replicated run and/or proof |
 | `aggregate-proof` | deterministic branch aggregation | `worker-proof` or `verifier` | `250,000 KAI` | low concurrency | `zkVM` / Bonsol path |
 | `artifact-retention` | storage/serving duty | `artifact-peer` | `50,000 KAI` | storage-capacity based | availability checks |
@@ -123,7 +123,6 @@ The next version of the program should check all of these at claim/assignment ti
 
 3. `capability class`
 - deterministic-only
-- `ezkl-v1`
 - `zkvm-v1`
 - `bonsol-v1`
 - premium replicated branch

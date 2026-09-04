@@ -1,3 +1,12 @@
+# The host toolchain, pinned. `channel = "stable"` floated: every image that built this
+# crate compiled the `host` binary with whatever stable was on the day, and rustup
+# resolves this file for the guest build too, because `risc0-build` strips
+# RUSTUP_TOOLCHAIN before it invokes the guest's cargo.
+#
+# It does not reach the guest's image id -- measured, 1.90.0, 1.94.1 and stable 1.98.1
+# each produce a byte-identical guest ELF, because `risc0-build` sets RUSTC to the rzup
+# RISC Zero rustc (see `IMAGE_ID.md`). It does reach the verifier binary that carries
+# that guest, which is reason enough not to leave it floating.
 [toolchain]
-channel = "stable"
+channel = "1.90.0"
 components = ["rustfmt", "rust-src"]

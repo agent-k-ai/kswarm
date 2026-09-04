@@ -370,7 +370,7 @@ def test_predict_open_interrupt_resume_cancel(cli_home: Path, validator_rpc: str
     assert run["status"] == "opening"
     assert run["base_nonce"] == base_nonce
     assert [entry["status"] for entry in run["branch_jobs"]] == ["committed", "committed", "planned", "planned"]
-    assert run["aggregate"]["status"] == "planned"
+    assert run["aggregate"]["status"] == "deferred"
     assert run["parent_manifest"]["combiner_parameters"] == {"trim_bps": 2500}
 
     status = run_cli(cli_home, validator_rpc, "predict", "status", parent_run)
@@ -380,7 +380,7 @@ def test_predict_open_interrupt_resume_cancel(cli_home: Path, validator_rpc: str
         ("committed", "open"),
         ("planned", "missing"),
         ("planned", "missing"),
-        ("planned", "missing"),
+        ("deferred", "missing"),
     ]
     branch0 = run_cli(cli_home, validator_rpc, "inspect", "job", run["branch_jobs"][0]["job"])["account"]
     assert branch0["nonce"] == base_nonce
@@ -393,7 +393,9 @@ def test_predict_open_interrupt_resume_cancel(cli_home: Path, validator_rpc: str
     run = _manifest(cli_home, parent_run)
     assert run["status"] == "open"
     assert all(entry["status"] == "committed" for entry in run["branch_jobs"])
-    assert run["aggregate"]["status"] == "committed"
+    # The aggregate job is opened by `predict bind-aggregate`, once these branches
+    # settle: its input artifact carries their receipts.
+    assert run["aggregate"]["status"] == "deferred"
     for entry in run["branch_jobs"]:
         account = run_cli(cli_home, validator_rpc, "inspect", "job", entry["job"])["account"]
         assert account["status_name"] == "open"
@@ -401,39 +403,39 @@ def test_predict_open_interrupt_resume_cancel(cli_home: Path, validator_rpc: str
         assert account["nonce"] == entry["nonce"]
         assert account["required_software_digest"] == entry["required_software_digest"]
 
-    aggregate = run_cli(cli_home, validator_rpc, "inspect", "job", run["aggregate_job"])["account"]
-    assert aggregate["status_name"] == "open"
-    assert aggregate["job_class_name"] == "aggregate-proof"
-    assert aggregate["nonce"] == base_nonce + 4
-    assert aggregate["required_software_digest"] == AGGREGATE_REDUCER_IMAGE_ID
-    # The branch reducer rejects the aggregate artifact (no `score_hex`), so no journal
-    # hash exists for it and the job is opened with `expected_result_hash` unset.
+    assert run_cli(cli_home, validator_rpc, "inspect", "job", run["aggregate_job"]).get("account") is None
+    assert run["aggregate_input_cid"] is None
+    assert run["aggregate_image_id"] == AGGREGATE_REDUCER_IMAGE_ID
     assert run["bonsol"] == {
         "bound": False,
-        "reason": "score_hex must be a string of 64 lowercase hex digits",
+        "reason": "aggregate job is opened by predict bind-aggregate",
         "image_id": AGGREGATE_REDUCER_IMAGE_ID,
     }
-    assert aggregate["expected_result_hash"] == "00" * 32
-    assert aggregate["input_cid"] == run["aggregate_input_cid"]
-    pinned = httpx.post(f"{ipfs_api_url}/api/v0/cat", params={"arg": run["aggregate_input_cid"]}, timeout=30)
+    # The plan is pinned even though the job is not open: it names the branch jobs, the
+    # combiner and the reducer image this run committed to before any branch ran.
+    pinned = httpx.post(f"{ipfs_api_url}/api/v0/cat", params={"arg": run["aggregate_plan_cid"]}, timeout=30)
     pinned.raise_for_status()
-    assert _framed_sha256(pinned.content) == aggregate["input_bundle_hash"]
-    aggregate_input = json.loads(pinned.content)
-    assert aggregate_input["combiner_parameters"] == {"trim_bps": 2500}
-    assert aggregate_input["bonsol"]["image_id"] == AGGREGATE_REDUCER_IMAGE_ID
+    aggregate_plan = json.loads(pinned.content)
+    assert aggregate_plan["combiner_parameters"] == {"trim_bps": 2500}
+    assert aggregate_plan["bonsol"]["image_id"] == AGGREGATE_REDUCER_IMAGE_ID
+    assert [item["job"] for item in aggregate_plan["branch_jobs"]] == [entry["job"] for entry in run["branch_jobs"]]
 
     again = run_cli(cli_home, validator_rpc, "predict", "resume", parent_run)
     assert again["status"] == "already-open"
 
     cancelled = run_cli(cli_home, validator_rpc, "predict", "cancel", parent_run, "--as", "customer-b")
     assert cancelled["run_status"] == "cancelled"
-    assert sorted(cancelled["cancelled_jobs"]) == sorted([*(entry["job"] for entry in run["branch_jobs"]), run["aggregate_job"]])
+    # Four branch jobs on chain; the aggregate was never opened, so it is only retired
+    # in the manifest.
+    assert sorted(cancelled["cancelled_jobs"]) == sorted(entry["job"] for entry in run["branch_jobs"])
     assert cancelled["skipped_jobs"] == []
-    for entry in [*run["branch_jobs"], run["aggregate"]]:
+    for entry in run["branch_jobs"]:
         assert run_cli(cli_home, validator_rpc, "inspect", "job", entry["job"])["account"]["status_name"] == "cancelled"
+    assert _manifest(cli_home, parent_run)["aggregate"]["status"] == "cancelled"
     assert _manifest(cli_home, parent_run)["status"] == "cancelled"
     refused = run_cli_raw(cli_home, validator_rpc, "predict", "resume", parent_run)
     assert refused.returncode != 0
     assert "cancelled" in refused.stdout + refused.stderr
     refund = run_cli(cli_home, validator_rpc, "token", "balance", "customer-b")
+    # The aggregate reward never left the customer: that job was never opened.
     assert refund["amount"] == 102 * 10**6, "every escrow was returned"

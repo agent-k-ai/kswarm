@@ -182,24 +182,36 @@ kswarm predict cancel <parent-run> --as customer   # cancels awaiting-artifact/o
 
 ### Aggregate job binding
 
-`settle_aggregate_proof_job` only settles a job whose `required_software_digest`, `input_bundle_hash`, and `expected_result_hash` match the Bonsol marker's image id, input digest, and journal hash. `predict open` therefore binds the aggregate job at open time, the same way the callback harness does:
+`settle_aggregate_proof_job` only settles a job whose `required_software_digest`, `input_bundle_hash`, and `expected_result_hash` match the Bonsol marker's image id, input digest, and journal hash. All three are fixed by `open_job` and never change afterwards, and two of them are functions of the branch receipts. So the aggregate job is **not** opened by `predict open`. It is planned there and opened by `predict bind-aggregate` once its branches have settled.
+
+### `predict bind-aggregate <parent-run>`
+
+Builds the aggregate input artifact from the branch receipts the chain accepted, works out the journal the reducer guest will commit, pins the artifact, and opens and commits the aggregate job bound to both.
+
+| Option | Purpose |
+| --- | --- |
+| `--as <wallet>` | Customer wallet. Defaults to the wallet recorded in the run manifest. |
+| `--allow-completed-branches` | Bind against branches that are `Completed` and attested but not yet settled. |
+| `--aggregate-image-id <hex>` | Reducer image id. Defaults to `KSWARM_AGGREGATE_IMAGE_ID`, then the pin in `kswarm_cli/reducer_image.py`. |
+| `--ipfs-api-url <url>` | Override the local IPFS API URL. |
 
 | Job field | Value |
 | --- | --- |
-| `required_software_digest` | reducer image id: `--aggregate-image-id`, else `KSWARM_AGGREGATE_IMAGE_ID`, else `kswarm_cli/reducer_image.py` |
-| `input_bundle_hash` | `sha256(u64le(len) || aggregate-input.json)`: the committed input artifact, framed as the reducer reads it |
-| `expected_result_hash` | `sha256(input_digest || committed_outputs)`, where `committed_outputs` mirrors the reducer guest over the same input -- **unset (all zero) when the reducer would reject the input**, see below |
+| `required_software_digest` | the aggregate reducer image id |
+| `input_bundle_hash` | `sha256(u64le(len) || aggregate-input.json)`: the committed MFA3 artifact, framed as the guest reads it |
+| `expected_result_hash` | `sha256(input_digest || committed_outputs)`, where `committed_outputs` is the 73-byte journal tail the guest commits for that artifact |
 
-The aggregate input carries the rule (`"bonsol": {"image_id", "public_input": "input-artifact", "framing": "u64le-length-prefix"}`), and the run manifest records the full binding under `bonsol`.
+The command refuses rather than opening a job that cannot settle. A branch that is not settled, a receipt whose bytes do not hash to its on-chain `submitted_result_hash`, or an artifact the reducer would reject all stop it before any escrow moves.
 
-**The default reducer image cannot consume the aggregate input today.** `kswarm_cli/reducer_image.py` names `protocol/bonsol-branch-reducer`, whose input is one branch's `{branch_key, child_job_id, parent_request_id, line_count, word_count, score_hex}`. The aggregate artifact is a different document -- the branch job list, the combiner and its parameters -- with no `score_hex`, and since `fix/proof-binding` made `score_hex` a required BN254 field element the reducer rejects it outright. There is therefore no journal hash to write. `predict open` opens the aggregate job with `expected_result_hash` all zero, prints
+`predict open` still records the reducer image id (in the parent manifest and under `aggregate_image_id`), pins an `aggregate-plan.json` naming the branch jobs and the combiner, and prints on stderr, after the `parent_run=` line:
 
 ```
-warning: aggregate job opened UNBOUND: the reducer image <id> rejects the aggregate input
-(score_hex must be a string of 64 lowercase hex digits), so expected_result_hash is unset ...
+aggregate job <pubkey> is planned, not opened: its input artifact carries the branch
+receipts, which do not exist yet. Run `kswarm predict bind-aggregate <pubkey>` once the
+branches have settled.
 ```
 
-on stderr after the `parent_run=` line, and records `{"bound": false, "reason": ..., "image_id": ...}` under `bonsol` in the run manifest. `required_software_digest` and `input_bundle_hash` are still set: the first gates who may claim the job, the second is a hash of the CLI's own artifact and holds whatever the reducer does. Point `--aggregate-image-id` at a reducer whose input **is** the aggregate artifact and the binding is computed normally. Until such a reducer exists the aggregate job cannot be settled by `settle_aggregate_proof_job`; branch jobs are unaffected. The aggregator's Bonsol hook must execute the reducer over exactly the committed input artifact, framed with a little-endian u64 length prefix, for its marker to settle. Only a worker registered with the same software digest can claim the job (`worker register --software-digest <image-id>`).
+Only a worker registered with the same software digest can claim the job (`worker register --software-digest <image-id>`), and its aggregator needs `KSWARM_BONSOL_AGGREGATE_COMMAND` pointing at a Bonsol execution hook. Layouts and the rebuild procedure are in [Proof Layer Status](proof-layer-status.md).
 
 Flagship demos use three additional `predict open` options:
 
@@ -207,7 +219,7 @@ Flagship demos use three additional `predict open` options:
 | --- | --- |
 | `--context-file <path>` | Embed a UTF-8 seed/context file in each branch input and hash-bind it in the parent manifest. |
 | `--personas-file <path>` | Load a deterministic JSON persona array and assign personas to branches by branch index. |
-| `--defer-aggregate-open` | Create the parent manifest and branch jobs now, but leave the aggregate job unopened (manifest status `deferred`) so a runner can open it later with its own Bonsol image, input, and journal commitments. |
+| `--defer-aggregate-open` | Accepted and ignored. Every run defers the aggregate open now; the flag is kept so older callers keep working. |
 
 Inspect the run:
 

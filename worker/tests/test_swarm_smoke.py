@@ -44,7 +44,15 @@ def test_swarm_smoke_end_to_end() -> None:
 
 
 def test_smoke_script_is_executable_and_uses_strict_mode() -> None:
+    """`set -euo pipefail` must be the first thing the script actually does.
+
+    Asserted structurally rather than within the first N lines: the header is prose and
+    grows, and a fixed window turns a documentation edit into a test failure while
+    still passing a script that sets the options halfway down.
+    """
+
     assert os.access(SCRIPT, os.X_OK), "scripts/swarm-smoke.sh must be executable"
-    head = SCRIPT.read_text(encoding="utf-8").splitlines()[:40]
-    assert head[0] == "#!/usr/bin/env bash"
-    assert "set -euo pipefail" in head
+    lines = SCRIPT.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "#!/usr/bin/env bash"
+    executable = [line for line in lines[1:] if line.strip() and not line.lstrip().startswith("#")]
+    assert executable[0] == "set -euo pipefail"

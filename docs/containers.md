@@ -16,10 +16,23 @@ worker is retired; see [Foundation Prototype](protocol-foundation-prototype.md).
 
 | Target | Entry point | Listens | What it does |
 | --- | --- | --- | --- |
-| `branch-worker` | `kswarm-branch-worker` | `:9461/metrics` | Claims branch-proof jobs it can execute, runs the LLM branch, submits the receipt. |
-| `verifier-worker` | `kswarm-verifier-worker` | `:9462/metrics` | Re-executes completed branches, attests, challenges a mismatch. |
+| `branch-worker` | `kswarm-branch-worker` | `:9461/metrics` | Claims branch-proof jobs it can execute, runs the LLM branch, proves the branch canonicalization receipt, submits the receipt. |
+| `verifier-worker` | `kswarm-verifier-worker` | `:9462/metrics` | Re-executes completed branches, verifies their receipts, attests, challenges a mismatch. |
 | `aggregator-runner` | `kswarm-aggregator-runner` | `:9463/metrics` | Combines attested branches of a run and submits the aggregate receipt. |
 | `cli` | `kswarm` | nothing | Operator commands: bootstrap, `predict`, `settle`, inspection. |
+
+`branch-worker` and `verifier-worker` additionally carry the zkVM prover: the
+`zkvm-reducer` host binary at `/opt/kswarm/bin/kswarm-zkvm-reducer`, with the guest ELF
+compiled into it and that guest's image id recorded beside it at
+`/opt/kswarm/share/kswarm-zkvm-image-id`. It is built in a stage of its own from RISC
+Zero components pinned to exact versions, and the build fails if the id it produces is
+not the one `protocol/zkvm-reducer/IMAGE_ID` pins. `aggregator-runner` and `cli` do not
+carry it: neither proves anything, and it is 150 MB of attack surface.
+
+The aggregate proof is a different shape. Requesting a Bonsol execution needs the Bonsol
+CLI, a funded client keypair and a docker socket, none of which belong in a hardened
+worker, so the aggregator calls a proving service instead: see
+[Proof Layer Status](proof-layer-status.md).
 
 Every image:
 
@@ -69,8 +82,15 @@ the Node stack, and the Flask app never enter the build context.
 | `KSWARM_CLAIM_COOLDOWN_SECONDS`, `KSWARM_EXECUTE_DEADLINE_MARGIN_SECONDS` | branch | Claim discipline (PR #7). |
 | `VERIFIER_REEXECUTE`, `VERIFIER_HASH_ONLY` | verifier | Re-execution is the default; hash-only must be chosen by name. |
 | `KSWARM_CHALLENGE_ON_MISMATCH` | verifier | Challenge a receipt whose re-execution differs. |
-| `KSWARM_BONSOL_AGGREGATE_COMMAND` | aggregator | Bonsol hook; unset means the aggregate receipt cannot settle on chain. |
+| `KSWARM_BONSOL_AGGREGATE_COMMAND` | aggregator | Bonsol hook. Unset, the runner will not claim an aggregate job at all, because the receipt could never be proven. |
+| `KSWARM_BONSOL_HOOK_URL` | aggregator | The proving service `python -m aggregator_runner.bonsol_http_hook` calls. |
+| `KSWARM_ALLOW_UNBOUND_AGGREGATE` | aggregator | `1` submits an aggregate receipt with no proof. Local stacks only; refused on devnet and mainnet. |
 | `KSWARM_AGGREGATE_IMAGE_ID` | cli, bootstrap | Reducer image id for aggregate jobs and the aggregator's registration. |
+| `KSWARM_ZKVM_HOST` | branch, verifier | The prover. Defaults to the binary the image carries; set it empty to turn the proof path off. |
+| `KSWARM_ZKVM_IMAGE_ID`, `KSWARM_ZKVM_IMAGE_ID_FILE` | verifier | The guest a receipt must name. The file defaults to the id the image was built with. |
+| `KSWARM_ZKVM_REQUIRE_RECEIPT` | verifier | `1` (the compose default) refuses to attest to a branch that carries no receipt. |
+| `KSWARM_ZKVM_TIMEOUT_SECONDS` | branch, verifier | Prove and verify timeout; 1800 by default. Proving costs tens of seconds of CPU per branch, so the execution window has to be longer than it. |
+| `KSWARM_PROVER_CPUS`, `KSWARM_PROVER_MEMORY` | branch, verifier | Resource limits for the two services that prove; 8 CPUs and 12 GB by default. The RISC Zero prover is not a 1 GB workload: at the old shared limit it was killed outright (`zkvm host prove exited -9`). A deployment with the proof path off can lower them. |
 
 ## Compose profiles
 
@@ -156,9 +176,24 @@ $compose --profile local down -v      # drop the chain, wallets, and artifacts
 ```
 
 `scripts/swarm-smoke.sh` runs that whole path end to end (build, up, bootstrap,
-one two-branch prediction, report, settle, down) and writes a log under
-`runtime/swarm-smoke/`. `worker/tests/test_swarm_smoke.py` wraps it under the
-`integration` marker (`KSWARM_SWARM_SMOKE=1`).
+one two-branch prediction, report, settle branches, bind and aggregate, down) and
+writes a log under `runtime/swarm-smoke/`. `worker/tests/test_swarm_smoke.py` wraps it
+under the `integration` marker (`KSWARM_SWARM_SMOKE=1`).
+
+Branch receipts are proven and verified inside the containers on every run, because the
+two worker images carry the prover. The aggregate proof is not, by default: this stack
+has no Bonsol node, so the aggregator is told explicitly that an unproven receipt is
+acceptable and the aggregate job stays unsettled, which the script's final JSON reports
+as `"aggregate_proven": false`.
+
+`KSWARM_SMOKE_BONSOL=1` runs the proven path instead. It brings up
+`docker-compose.bonsol.yml`, points the swarm stack at that validator, starts
+`protocol/scripts/bonsol-hook-server.py` on the host with the Bonsol CLI wrappers and
+the client keypair, and then attests, waits out the challenge window and settles the
+aggregate against its marker. It reports the marker PDA and the settle signature. All
+its builds go through `scripts/heavy-build-lock.sh`, a host-wide lock, because a build
+host is often shared and a per-caller "one build at a time" rule cannot see the other
+callers.
 
 ## Registry and releases
 

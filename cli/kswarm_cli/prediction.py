@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import Any
 
 
-# Combiner registry. Ids are the reducer's (`protocol/bonsol-branch-reducer/src/lib.rs`,
-# `COMBINER_*`); names are the aggregator's (`worker/aggregator_runner/combiners.py`,
+# Combiner registry. Ids are the reducer's (`protocol/bonsol-aggregate-reducer/src/combiner.rs`,
+# `COMBINER_*`); names are the aggregate reduction's (`cli/kswarm_cli/aggregate.py`,
 # `COMBINER_IDS`). `tests/test_prediction.py` checks both against the source files.
 COMBINERS: dict[str, int] = {"weighted-mean": 1, "trimmed-mean": 2, "majority-vote": 3}
 SCALAR_COMBINERS = frozenset({"weighted-mean", "trimmed-mean"})

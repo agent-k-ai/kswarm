@@ -10,9 +10,10 @@ from typing import Any
 import openai
 
 from app.protocol.branch_schemas import BranchInput, BranchOutput
-from app.protocol.canonical_hash import branch_output_result_bytes, canonical_json_bytes
+from app.protocol.canonical_hash import branch_output_result_bytes, branch_result_hash, canonical_json_bytes
 from app.utils.llm_client import LLMClient, LLMJsonResult
 
+from worker_common import branch_receipt
 from worker_common.ipfs import IpfsClient
 
 from .parsing import (
@@ -24,6 +25,10 @@ from .parsing import (
     parse_model_response,
 )
 
+
+import logging
+
+LOGGER = logging.getLogger("kswarm.branch_worker.executor")
 
 LLM_SEED_MODULUS = 2_147_483_647
 
@@ -85,6 +90,15 @@ class LlmEndpointError(ExecutionError):
         self.retryable = retryable
 
 
+class BranchReceiptFailed(ExecutionError):
+    """Proving the branch canonicalization receipt failed.
+
+    The branch fails closed: nothing is submitted. A worker that proves receipts must
+    not settle one it could not prove, because the verifier will refuse to attest to a
+    branch whose receipt is missing or wrong and the job would time out anyway.
+    """
+
+
 class ModelOutputRejectedError(ExecutionError):
     """Every bounded attempt produced output that failed strict parsing.
 
@@ -119,6 +133,9 @@ class BranchExecution:
     prompt_tokens: int | None
     total_tokens: int | None
     attempts: int
+    # Set only when this worker proved a branch canonicalization receipt.
+    zkvm_receipt_cid: str | None = None
+    zkvm_prove_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -137,8 +154,15 @@ class BranchExecutor:
         llm_base_url: str | None = None,
         llm_model_name: str | None = None,
         client: Any | None = None,
+        zkvm_host: str | None = None,
+        zkvm_timeout_seconds: float | None = None,
     ):
         self.ipfs = ipfs
+        # Proving is minutes of CPU, so it is opt-in per worker. A worker with the
+        # binary configured proves every branch and fails the branch closed when
+        # proving fails; a worker without it publishes no receipt and says so.
+        self.zkvm_host = zkvm_host if zkvm_host is not None else branch_receipt.host_binary()
+        self.zkvm_timeout_seconds = zkvm_timeout_seconds if zkvm_timeout_seconds is not None else branch_receipt.timeout_seconds()
         self.llm_base_url = llm_base_url or os.environ.get("LLM_BASE_URL")
         self.llm_model_name = llm_model_name or os.environ.get("LLM_MODEL_NAME")
         if not self.llm_base_url:
@@ -239,6 +263,11 @@ class BranchExecutor:
             transcript,
         )
         output = parsed_output.model_copy(update={"transcript_cid": transcript_cid, "completed_at_unix": int(time.time())})
+        receipt_cid: str | None = None
+        receipt_seconds: float | None = None
+        if self.zkvm_host and verifier_reference is None:
+            receipt_cid, receipt_seconds = self._prove_branch_receipt(branch_input, output)
+            output = output.model_copy(update={"zkvm_receipt_cid": receipt_cid})
         output_cid = self.ipfs.add_json(f"branch-{branch_input.branch_index}-output.json", output.model_dump(mode="json", exclude_none=False))
         result_bytes = branch_output_result_bytes(output)
         return BranchExecution(
@@ -252,7 +281,49 @@ class BranchExecutor:
             answer.result.prompt_tokens,
             answer.result.total_tokens,
             len(answer.rejected_attempts) + 1,
+            receipt_cid,
+            receipt_seconds,
         )
+
+    def _prove_branch_receipt(self, branch_input: BranchInput, output: BranchOutput) -> tuple[str, float]:
+        """Prove that this document encodes to the receipt this branch will submit.
+
+        The guest is shown the document without `zkvm_receipt_cid`, which is set from
+        the CID this returns. A failure raises: the branch fails closed and submits
+        nothing, rather than settling a receipt nothing proved.
+        """
+
+        started = time.time()
+        try:
+            bundle = branch_receipt.prove(
+                self.zkvm_host,
+                branch_input.model_dump(mode="json", exclude_none=False),
+                output.model_dump(mode="json", exclude_none=False),
+                timeout=self.zkvm_timeout_seconds,
+            )
+        except branch_receipt.BranchReceiptError as exc:
+            raise BranchReceiptFailed(f"branch receipt proving failed: {exc}") from exc
+        elapsed = time.time() - started
+        expected = branch_receipt.expected_journal(
+            branch_input.model_dump(mode="json", exclude_none=False),
+            output.model_dump(mode="json", exclude_none=False),
+            branch_result_hash(output),
+        )
+        journal = branch_receipt.ReceiptJournal.from_json(bundle["journal"])
+        if journal != expected:
+            raise BranchReceiptFailed(
+                f"the receipt this worker just produced does not describe its own output: "
+                f"journal={journal.to_json()} expected={expected.to_json()}"
+            )
+        cid = self.ipfs.add_json(f"branch-{branch_input.branch_index}-zkvm-receipt.json", bundle)
+        LOGGER.info(
+            "branch %s receipt proved in %.1fs image_id=%s cid=%s",
+            branch_input.branch_index,
+            elapsed,
+            bundle["image_id_hex"],
+            cid,
+        )
+        return cid, elapsed
 
     def _ask_model(
         self,

@@ -60,8 +60,19 @@ RUN python3 -m venv "${PROTOCOL_EZKL_VENV}" \
     && "${PROTOCOL_EZKL_VENV}/bin/pip" install --no-cache-dir ezkl==23.0.5 onnx==1.18.0 numpy==2.2.4 \
     && "${PROTOCOL_EZKL_VENV}/bin/python" /app/protocol/proofs/ezkl/prepare_assets.py --output-dir "${PROTOCOL_EZKL_ASSETS_DIR}"
 
+# `--locked` and the id assertion for the same reason `docker/swarm/Dockerfile` has
+# them: this image's binary carries a guest ELF, and a verifier that trusts one binary's
+# id must get the same one from every image that builds it. The RISC Zero components
+# above are already pinned to the versions that produce it.
 RUN cd /app/protocol/zkvm-reducer \
-    && cargo build --release -p host \
-    && cp /app/protocol/zkvm-reducer/target/release/host "${PROTOCOL_ZKVM_REDUCER_BIN}"
+    && cargo build --release --locked -p host \
+    && cp /app/protocol/zkvm-reducer/target/release/host "${PROTOCOL_ZKVM_REDUCER_BIN}" \
+    && built="$("${PROTOCOL_ZKVM_REDUCER_BIN}" image-id)" \
+    && pinned="$(tr -d '[:space:]' < /app/protocol/zkvm-reducer/IMAGE_ID)" \
+    && if [ "${built}" != "${pinned}" ]; then \
+         echo "guest image id drift: built ${built}, protocol/zkvm-reducer/IMAGE_ID pins ${pinned}" >&2; \
+         exit 1; \
+       fi \
+    && echo "branch canonicalization guest image id ${built}"
 
 WORKDIR /app/protocol

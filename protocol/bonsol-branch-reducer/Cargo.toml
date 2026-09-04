@@ -1,12 +1,16 @@
-# The package name stays `mirofish_bonsol_branch_reducer` on purpose. This crate is the
+# The package name stays `mirofish_bonsol_branch_reducer` on purpose. This crate is a
 # RISC Zero guest, and its package name reaches the loaded memory image: the crate name
 # sits in the symbol and section tables, so its length moves `e_shoff` in the mapped ELF
 # header, which `Program::load_elf` maps like any other PT_LOAD. Renaming the package
-# therefore changes the image id. That id is pinned in `cli/kswarm_cli/reducer_image.py`
-# as every aggregate job's `required_software_digest`, and it was recorded from live
-# flagship demo runs. Changing it is a deliberate reducer version bump -- a real
-# `bonsol build` through `protocol/scripts/run-bonsol-builder.sh` plus re-recorded demo
-# transcripts -- not a side effect of a product rename.
+# therefore changes the image id.
+#
+# This guest is no longer on the aggregate path -- `protocol/bonsol-aggregate-reducer`
+# is, and `cli/kswarm_cli/reducer_image.py` pins that one as every aggregate job's
+# `required_software_digest`. What still depends on this crate is
+# `protocol/bonsol-callback-harness` and the Bonsol callback, marker-PDA and replay
+# smoke tests it drives. Those read the image id out of the manifest the builder writes,
+# so a rename would not break them silently -- it would just move an id for no reason,
+# in a guest nothing else is allowed to change. Leave it alone.
 [package]
 name = "mirofish_bonsol_branch_reducer"
 version = "0.1.0"

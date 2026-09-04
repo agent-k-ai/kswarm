@@ -67,6 +67,7 @@ class FakeJob:
     input_bundle_hash: bytes = ZERO_HASH
     expected_result_hash: bytes = ZERO_HASH
     submitted_result_hash: bytes = ZERO_HASH
+    result_bytes: bytes = b""
     verifier_authority: Pubkey | None = None
     verifier_attestation_hash: bytes | None = None
     assigned_verifier_authority: Pubkey | None = None
@@ -119,6 +120,7 @@ class FakeProtocol:
             raise RpcError("InvalidJobState", "job is not claimed")
         job.status = JOB_STATUS_BY_NAME["completed"]
         job.output_cid = output_cid
+        job.result_bytes = result_bytes
         job.submitted_result_hash = hashlib.sha256(result_bytes).digest()
         self.receipts.append((job_key, output_cid, result_bytes))
         return "receipt-signature"

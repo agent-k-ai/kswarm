@@ -96,6 +96,24 @@ Rules that CI enforces with `scripts/check-no-secrets.sh` (run it locally before
 - no tracked `*-keypair.json`, `*.keypair.json`, `swarm.key`, `*.key`, `*.pem`, `*.log`, `runtime/**`, `solana/deploy/**`, or `.env*` other than `.env.example`
 - no tracked blob that contains a 64-byte secret-key array, a PEM private-key block, or an IPFS swarm key header
 
+### One heavy build at a time
+
+Guest builds, image builds and `cargo build-sbf` each saturate a machine, and more than
+one agent or operator can be driving the same build host. A per-caller "one at a time"
+rule cannot see the other callers, so the exclusion lives outside all of them:
+`scripts/heavy-build-lock.sh` takes a host-wide `flock` and runs the command under it.
+
+```bash
+scripts/heavy-build-lock.sh docker build -f docker/swarm/Dockerfile --target cli .
+```
+
+`protocol/scripts/build-aggregate-reducer.sh`, `scripts/swarm-smoke.sh` and
+`scripts/bootstrap-handson.sh` already wrap their own heavy steps, so an operator using
+those does not have to think about it. `KSWARM_HEAVY_BUILD_LOCK` names the lock file and
+`KSWARM_HEAVY_BUILD_LOCK_WAIT` the seconds to wait for it. On a machine where the lock
+directory does not exist -- a laptop, a single-job CI runner -- the command runs
+unlocked and says so.
+
 Containers run as uid 1000 (`node` in `docker/protocol-node`, `builder` in `docker/program-builder`, `app` in the root `Dockerfile`, `ipfs` for Kubo). Bind-mounted runtime directories therefore must belong to the host user with uid 1000: run `install -d -m 700 runtime/protocol runtime/ipfs` before the first `docker compose up`. The only root service is `protocol-program-builder`, because `solana-verify` drives the host Docker socket; the compose file says so next to the override.
 
 Base images are pinned by digest with the tag in a comment. To move a pin, resolve the new digest and update both:
@@ -164,7 +182,7 @@ Check health:
 make dev-status
 docker compose -f docker-compose.dev.yml --profile core ps
 docker logs kswarm-ipfs-kubo
-docker logs kswarm-bonsol-node
+docker compose -f docker-compose.bonsol.yml logs bonsol-node
 ```
 
 Reset local state:

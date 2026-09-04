@@ -1,0 +1,48 @@
+# The Bonsol aggregate reducer guest, and the shared definitions it is built from.
+#
+# Guest and library live in one package on purpose. `bonsol build` runs the RISC Zero
+# docker build with the guest directory as the docker context (`risc0-build`
+# `DockerOptions::root_dir` defaults to the current directory, and the Bonsol CLI
+# chdirs into `--zk-program-path` first), so a path dependency outside this directory
+# is simply absent from the build. Everything the guest needs is therefore here, and
+# the callback harness, the branch-receipt guest and the cross-language vector tests
+# depend on this package by path so there is one definition of every rule.
+#
+# The package name reaches the loaded memory image and so determines the image id.
+# Renaming it is a deliberate reducer version bump: a real `bonsol build` through
+# `protocol/scripts/run-bonsol-builder.sh` and a new pin in
+# `cli/kswarm_cli/reducer_image.py`.
+[package]
+name = "kswarm_bonsol_aggregate_reducer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata.zkprogram]
+input_order = ["Public"]
+
+[build]
+target-dir = "./target"
+
+[workspace]
+
+[features]
+default = ["std"]
+std = ["sha2/std", "serde_json/std"]
+
+[dependencies]
+# risc0 is pinned to =3.0.3 everywhere. The guest reads its framed public input and
+# commits its journal through this crate; every hash it computes comes from `sha2`.
+risc0-zkvm = { version = "=3.0.3", default-features = false, features = ["std"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.10", default-features = false }
+
+# The guest ELF is built by `risc0-build` with the rzup risc0 Rust toolchain, which is
+# 1.88.0-dev for the 3.0.3 line. `ruint` and `enum-ordinalize`/`-derive` are therefore
+# held in Cargo.lock below the versions that raised their MSRV past it: ruint 1.20.0
+# needs rustc 1.90 and enum-ordinalize 4.4.2 needs 1.89, and `bonsol build` fails
+# outright on both. Build with the committed lockfile, and raise them only together
+# with the rzup Rust toolchain.
+
+[dev-dependencies]
+proptest = "1.6"

@@ -37,8 +37,7 @@ from kswarm_cli.prediction import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-REDUCER_LIB = REPO_ROOT / "protocol" / "bonsol-branch-reducer" / "src" / "lib.rs"
-AGGREGATOR_COMBINERS = REPO_ROOT / "worker" / "aggregator_runner" / "combiners.py"
+REDUCER_LIB = REPO_ROOT / "protocol" / "bonsol-aggregate-reducer" / "src" / "combiner.rs"
 
 
 def test_combiner_ids_match_the_reducer_registry() -> None:
@@ -49,18 +48,12 @@ def test_combiner_ids_match_the_reducer_registry() -> None:
     assert found == COMBINERS
 
 
-def test_combiner_names_match_the_aggregator_when_present() -> None:
-    """The aggregator's `COMBINER_IDS` (PR feat/worker-trust) must be the same table."""
+def test_combiner_names_match_the_aggregate_reduction() -> None:
+    """One Python combiner table: the one the aggregate journal is computed from."""
 
-    if not AGGREGATOR_COMBINERS.exists():
-        pytest.skip(f"{AGGREGATOR_COMBINERS} is not on this branch yet")
-    source = AGGREGATOR_COMBINERS.read_text(encoding="utf-8")
-    match = re.search(r"COMBINER_IDS = \{(.*?)\}", source, re.S)
-    assert match, "COMBINER_IDS table not found"
-    found: dict[str, int] = {}
-    for name, constant in re.findall(r'"([a-z-]+)":\s*COMBINER_([A-Z_]+)', match.group(1)):
-        found[name] = int(re.search(rf"^COMBINER_{constant} = (\d+)$", source, re.M).group(1))
-    assert found == COMBINERS
+    from kswarm_cli.aggregate import COMBINER_IDS
+
+    assert COMBINER_IDS == COMBINERS
 
 
 @pytest.mark.parametrize("name", ["weighted-mean", "trimmed-mean", "majority-vote"])

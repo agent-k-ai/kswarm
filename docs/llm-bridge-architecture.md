@@ -69,30 +69,97 @@ Re-execution is the default (`VERIFIER_REEXECUTE=1`). The verifier:
 
 A verifier that cannot re-execute (LLM outage, IPFS outage, rejected model output) submits no attestation and retries the job on a later pass.
 
-## Aggregate Combiners And Bonsol Binding
+## Aggregate Reduction And The Bonsol Proof
 
-`worker/aggregator_runner/combiners.py` mirrors `protocol/bonsol-branch-reducer/src/lib.rs` step for step, and `worker/tests/test_aggregator_combiners.py` checks it against vectors computed by running the Rust crate. The runner dispatches on the manifest `combiner`:
+The aggregate job is opened by `kswarm predict bind-aggregate <parent-run>` once its
+branches have settled, not by `predict open`. `open_job` fixes `input_bundle_hash` and
+`expected_result_hash` for good, and both are functions of the branch receipts. The
+command reads each branch job's on-chain `result_bytes`, builds the `MFA3` artifact,
+reduces it, pins it, and opens the job against the framed artifact digest and the
+predicted journal hash.
+
+`cli/kswarm_cli/aggregate.py` is the one Python definition of that reduction, and it is
+the mirror of the guest in `protocol/bonsol-aggregate-reducer`. Both are pinned to
+`cli/tests/vectors/aggregate_journal_vectors.json`, so neither can change without the
+other failing. The combiner registry:
 
 | Combiner | Registry id | Inputs | Parameters |
 |---|---|---|---|
-| `weighted-mean` | `1` | `scalar_value_bps` of every branch | uniform weights (`combiner_parameters.weights` is rejected; the manifest carries no per-branch weights) |
-| `trimmed-mean` | `2` | `scalar_value_bps` of every branch | `parent_manifest.combiner_parameters.trim_bps` (required); `outlier_count = floor(branch_count * trim_bps / 10000)` |
-| `majority-vote` | `3` | `categorical_label_index` of every branch, checked against `output_schema.category_dictionary` | none; ties go to the lowest label |
+| `weighted-mean` | `1` | `scalar_value_bps` decoded from every branch receipt | per-branch `weight` in the artifact (uniform `1` as `bind-aggregate` writes it) |
+| `trimmed-mean` | `2` | `scalar_value_bps` decoded from every branch receipt | `trim_bps`; `outlier_count = floor(branch_count * trim_bps / 10000)`. Weights must be `1`, because this combiner averages unweighted |
+| `majority-vote` | `3` | `categorical_label_index` decoded from every branch receipt, checked against `category_dictionary_size` | `category_dictionary_size`; ties go to the lowest label |
 
-The Rust functions return an f64 mean; the runner rounds it half up to integer basis points. Unknown combiners, missing parameters, and outputs of the wrong kind fail the aggregation.
+The committed value is exact integer arithmetic, rounded half up as
+`(2*numerator + denominator) / (2*denominator)` in 128-bit integers, on both sides. No
+rounding mode and no floating-point unit has to agree for the journal to match.
 
-The aggregate output artifact (IPFS) records `combiner`, `combiner_id`, `combiner_parameters`, the result, `branch_count`, `output_schema_hash`, `aggregate_input_sha256`, and the Bonsol binding. Its canonical encoding is `MFA2` (schema `"MFA2"`, sorted keys; hashed behind the `MFA2` magic when it exceeds 512 bytes).
+**The runner does not decide the aggregate.** `worker/aggregator_runner` fetches the
+artifact the job committed, checks its framed digest against `input_bundle_hash`,
+re-reduces it, checks the journal against `expected_result_hash`, and checks every branch
+receipt in it against that branch job on chain. Then it claims, submits the guest's
+committed outputs as `result_bytes`, and only then runs
+`KSWARM_BONSOL_AGGREGATE_COMMAND` to get the proof. The order is forced:
+`record_aggregate_verification` requires a `Completed` job whose `submitted_result_hash`
+is the callback's `output_digest`.
 
-**Bonsol binding.** `settle_aggregate_proof_job` settles only when the marker's `output_digest == sha256(result_bytes)`, `input_digest == job.input_bundle_hash`, `image_id == job.required_software_digest`, and `journal_hash == job.expected_result_hash`. The receipt bytes must therefore be the reducer's committed outputs. When `KSWARM_BONSOL_AGGREGATE_COMMAND` is set, the runner:
+The hook receives one JSON argument (`run`, `aggregate_job`, `image_id`, `input_cid`,
+`input_artifact_hex`, `input_digest`, `committed_outputs`, `output_digest`,
+`journal_hash`, `result`) and must print
+`{execution_id, image_id, input_digest, output_digest, journal_hash, committed_outputs}`.
+The runner checks `sha256(committed_outputs) == output_digest` and
+`sha256(input_digest || committed_outputs) == journal_hash`, then checks every field
+against its own reduction and against the job account, so a hook that proved a different
+claim is an error. `protocol/scripts/bonsol-aggregate-hook.py` is the reference
+implementation.
 
-1. computes the combiner result
-2. runs the hook with one JSON argument: `run`, `aggregate_job`, `result`, and `aggregate_result_sha256` (the SHA-256 of the canonical `MFA2` encoding, so a reducer input can commit to it)
-3. requires the hook to print `{execution_id, image_id, input_digest, output_digest, journal_hash, committed_outputs}`
-4. checks `sha256(committed_outputs) == output_digest` and `sha256(input_digest || committed_outputs) == journal_hash`
-5. checks `input_digest`, `image_id`, and `journal_hash` against the aggregate job account, so a receipt that could never settle is never submitted
-6. claims the aggregate job and submits `committed_outputs` as `result_bytes`; the IPFS artifact records the binding and `receipt_binding: bonsol-committed-outputs`
+Without the hook the runner refuses to claim the job at all: a receipt that can never be
+proven leaves the customer to cancel and the worker's stake locked until the execute
+deadline. `KSWARM_ALLOW_UNBOUND_AGGREGATE=1` overrides that for a local stack with no
+Bonsol node, warns on every run, and is refused on the `devnet` and `mainnet` profiles.
 
-If the hook fails, prints anything else, or the binding does not match the job, the aggregation fails and nothing is claimed. Without the hook the runner submits the canonical `MFA2` bytes, records `receipt_binding: mfa2-canonical-unbound`, and logs a warning; that receipt cannot settle through `settle_aggregate_proof_job`.
+A containerized aggregator cannot run the reference hook itself: it has no Bonsol CLI,
+no funded client keypair and no docker socket, and it should not. It uses
+`python -m aggregator_runner.bonsol_http_hook`, which forwards the payload to a proving
+service (`protocol/scripts/bonsol-hook-server.py`) at `KSWARM_BONSOL_HOOK_URL` and
+returns the answer unchanged. The checks above are unaffected, and that is the point: a
+proving service that proved a different claim is refused by its caller.
+
+The aggregate output artifact (IPFS) records the combiner, the result, `branch_count`,
+the Merkle root, `output_schema_hash`, `aggregate_input_sha256`, the full journal, and
+`receipt_binding: bonsol-committed-outputs` (or `mfa3-committed-outputs-unproven`).
+
+## Branch Canonicalization Receipts
+
+Re-execution catches a worker that invented a forecast. It cannot catch a worker whose
+published document and submitted receipt describe different values, because the program
+stores only `sha256(result_bytes)` and never sees the document, and both sides of a
+re-execution comparison are the verifier's own bytes.
+
+With `KSWARM_ZKVM_HOST` set, the branch worker proves that gap closed. The
+`protocol/zkvm-reducer` guest is handed the output document and recomputes the receipt:
+canonical JSON of the hash preimage, the canonical hash, the `MFB2` encoding, and
+`sha256` of that encoding. It commits `input_digest || result_hash || output_len`. The
+worker pins the receipt bundle to IPFS and names it in `BranchOutput.zkvm_receipt_cid`,
+which is excluded from the canonical hash preimage because a receipt cannot be inside the
+document it proves.
+
+The verifier verifies that receipt against its own copy of the host binary, checks the
+image id against `KSWARM_ZKVM_IMAGE_ID` when pinned, and binds the journal to the claim:
+the input digest must be the frame rebuilt from this job's input and output, the result
+hash must be the on-chain `submitted_result_hash`, and the length must be the document it
+fetched. If re-execution disagrees as well, it attests to its own hash and challenges. If
+re-execution agrees but the receipt does not, it refuses to attest, and the job reaches
+its challenge deadline unsettleable.
+
+Proving is tens of seconds of CPU per branch, so it is opt-in per worker. A branch job
+whose execution window is shorter than the prove time would be slashed for a proof it
+could not finish. `KSWARM_ZKVM_REQUIRE_RECEIPT=1` makes a verifier refuse branches
+without one.
+
+The `branch-worker` and `verifier-worker` images carry the host binary and the id of the
+guest compiled into it, and default `KSWARM_ZKVM_HOST` and `KSWARM_ZKVM_IMAGE_ID_FILE`
+at both, so the proof path is on by default in containers and a verifier refuses a
+receipt from a guest its own image did not build.
 
 **Run state.** Run files are written to a temporary file in the same directory, fsynced, and renamed into place. Each run is processed under an exclusive non-blocking lock on `<parent-run>.lock`, so two runners on one host cannot both claim it. A claim that was made but not submitted is recorded (`aggregate_claimed_at_unix`) and resumed on the next pass while the job is still claimed by this wallet.
 

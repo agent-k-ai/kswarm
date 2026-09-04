@@ -40,6 +40,16 @@ x-worker-limits: &worker-limits
       cpus: "1.0"
       memory: 1g
 
+# The branch worker and the verifier run the RISC Zero prover, which is not a 1 GB
+# workload: proving a branch receipt was killed with SIGKILL at that limit
+# ("zkvm host prove exited -9"). These are the defaults for a machine that proves; a
+# deployment that turns the proof path off (KSWARM_ZKVM_HOST=) can lower them back.
+x-proving-limits: &proving-limits
+  resources:
+    limits:
+      cpus: "${KSWARM_PROVER_CPUS:-8.0}"
+      memory: ${KSWARM_PROVER_MEMORY:-12g}
+
 # Environment shared by the daemons and the CLI. The profile is selected with
 # KSWARM_CLUSTER; the RPC with KSWARM_RPC_URL (defaults fit the local profile).
 x-swarm-env: &swarm-env
@@ -101,7 +111,14 @@ x-branch-worker: &branch-worker
     KSWARM_WORKER_POLL_SECONDS: ${KSWARM_WORKER_POLL_SECONDS:-2.0}
     KSWARM_CLAIM_COOLDOWN_SECONDS: ${KSWARM_CLAIM_COOLDOWN_SECONDS:-300}
     KSWARM_EXECUTE_DEADLINE_MARGIN_SECONDS: ${KSWARM_EXECUTE_DEADLINE_MARGIN_SECONDS:-120}
-  deploy: *worker-limits
+    # The branch canonicalization prover shipped in this image. The default is the
+    # path the image bakes; `KSWARM_ZKVM_HOST=` (explicitly empty, no colon in the
+    # expansion) turns proving off and the worker then publishes no receipt.
+    # Proving costs tens of seconds of CPU per branch, so the execution window has to
+    # be long enough for it: a branch that misses its deadline is slashed.
+    KSWARM_ZKVM_HOST: ${KSWARM_ZKVM_HOST-/opt/kswarm/bin/kswarm-zkvm-reducer}
+    KSWARM_ZKVM_TIMEOUT_SECONDS: ${KSWARM_ZKVM_TIMEOUT_SECONDS:-1800}
+  deploy: *proving-limits
   depends_on:
     ipfs:
       condition: service_healthy
@@ -122,7 +139,18 @@ x-verifier-worker: &verifier-worker
     VERIFIER_REEXECUTE: ${VERIFIER_REEXECUTE:-true}
     VERIFIER_HASH_ONLY: ${VERIFIER_HASH_ONLY:-false}
     KSWARM_CHALLENGE_ON_MISMATCH: ${KSWARM_CHALLENGE_ON_MISMATCH:-true}
-  deploy: *worker-limits
+    # Receipt verification is complementary to re-execution, not a replacement:
+    # re-execution catches a worker that invented a forecast, the receipt catches one
+    # whose published document and submitted receipt describe different values.
+    KSWARM_ZKVM_HOST: ${KSWARM_ZKVM_HOST-/opt/kswarm/bin/kswarm-zkvm-reducer}
+    KSWARM_ZKVM_TIMEOUT_SECONDS: ${KSWARM_ZKVM_TIMEOUT_SECONDS:-1800}
+    # Empty means "use the id this image was built with", which the image records at
+    # KSWARM_ZKVM_IMAGE_ID_FILE. Set it only to accept a guest this image did not build.
+    KSWARM_ZKVM_IMAGE_ID: ${KSWARM_ZKVM_IMAGE_ID:-}
+    # Every worker in this stack proves, so a branch without a receipt is a branch this
+    # verifier will not attest to, and that job cannot settle.
+    KSWARM_ZKVM_REQUIRE_RECEIPT: ${KSWARM_ZKVM_REQUIRE_RECEIPT:-1}
+  deploy: *proving-limits
   depends_on:
     ipfs:
       condition: service_healthy
@@ -145,6 +173,18 @@ x-aggregator-runner: &aggregator-runner
     KSWARM_WORKER_POLL_SECONDS: ${KSWARM_WORKER_POLL_SECONDS:-2.0}
     KSWARM_BONSOL_AGGREGATE_COMMAND: ${KSWARM_BONSOL_AGGREGATE_COMMAND:-}
     KSWARM_BONSOL_HOOK_TIMEOUT_SECONDS: ${KSWARM_BONSOL_HOOK_TIMEOUT_SECONDS:-1800}
+    # This image carries no Bonsol CLI, no docker socket and no Bonsol client keypair,
+    # and it should not: those are the operator's proving infrastructure. Point
+    # KSWARM_BONSOL_AGGREGATE_COMMAND at `python -m aggregator_runner.bonsol_http_hook`
+    # and this URL at a `protocol/scripts/bonsol-hook-server.py` that holds them. The
+    # runner still checks every digest the service returns against its own reduction and
+    # against the job account, so a service that proved a different claim is refused.
+    KSWARM_BONSOL_HOOK_URL: ${KSWARM_BONSOL_HOOK_URL:-}
+    # Without the hook above the runner will not claim an aggregate job at all: a
+    # receipt it could never prove strands the customer's escrow and locks its own
+    # stake. `1` accepts that on a stack with no Bonsol node, warns on every run, and
+    # is refused outright on the devnet and mainnet cluster profiles.
+    KSWARM_ALLOW_UNBOUND_AGGREGATE: ${KSWARM_ALLOW_UNBOUND_AGGREGATE:-}
   deploy: *worker-limits
   depends_on:
     ipfs:

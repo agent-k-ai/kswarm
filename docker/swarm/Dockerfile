@@ -17,7 +17,79 @@
 ARG PYTHON_IMAGE=python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.11.29@sha256:eb2843a1e56fd9e30c7276ce1a52cba86e64c7b385f5e3279a0e08e02dd058fc
 
+ARG RUST_IMAGE=rust:1.90-slim-bookworm@sha256:64232e656c058f4468e8d024e990acff04f0fd5a5c0a88a574dc37773d7325c9
+
 FROM ${UV_IMAGE} AS uv
+
+# --- zkvm-builder: the branch canonicalization guest and the host that verifies it ---
+#
+# The branch worker proves, and the verifier verifies, that a branch output document
+# encodes to exactly the MFB2 receipt whose hash the chain accepted. Both need this
+# binary, and the guest ELF is compiled into it by `risc0-build`, so the image carries
+# the program it is pinned to rather than fetching one.
+#
+# Every RISC Zero component is pinned to an exact version. `rzup install` with no
+# version installs the newest of each, and that is how a guest image id moves without a
+# source change: the id is a property of the compiled ELF, so the toolchain is part of
+# the proof, not a build detail. These four versions and `protocol/zkvm-reducer/IMAGE_ID`
+# are one unit; the build fails below if they stop agreeing.
+FROM ${RUST_IMAGE} AS zkvm-builder
+
+ARG RISC0_RUST_VERSION=1.88.0
+ARG RISC0_CPP_VERSION=2024.1.5
+ARG RISC0_R0VM_VERSION=3.0.3
+ARG RISC0_CARGO_RISCZERO_VERSION=3.0.3
+
+# `protocol/zkvm-reducer/rust-toolchain.toml` asks for `stable`, which makes rustup try
+# to update the toolchain this image already pins. The host build uses the image's
+# toolchain; `risc0-build` clears this variable and calls the risc0 `rustc` by path for
+# the guest, so the guest is unaffected.
+ENV RUSTUP_TOOLCHAIN=1.90.0 \
+    CARGO_TERM_COLOR=never \
+    PATH=/root/.risc0/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      curl \
+      pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -L https://risczero.com/install | bash \
+    && rzup install rust "${RISC0_RUST_VERSION}" \
+    && rzup install cpp "${RISC0_CPP_VERSION}" \
+    && rzup install r0vm "${RISC0_R0VM_VERSION}" \
+    && rzup install cargo-risczero "${RISC0_CARGO_RISCZERO_VERSION}" \
+    && rzup show
+
+# The shared reducer crate is a path dependency of both the guest and the host, so one
+# definition of the journal layout reaches guest, host and the Python daemons alike.
+COPY protocol/bonsol-aggregate-reducer /src/protocol/bonsol-aggregate-reducer
+COPY protocol/zkvm-reducer /src/protocol/zkvm-reducer
+
+WORKDIR /src/protocol/zkvm-reducer
+RUN cargo build --release --locked -p host
+
+# The id this build produced must be the id the repository pins, or a verifier running
+# this image would refuse every receipt a worker running it produced.
+#
+# `IMAGE_ID` sits inside the copied crate, so editing it invalidates the build layer
+# above. That is the right trade: the pin changes when the guest changes, and when the
+# guest changes the guest has to be rebuilt anyway. Only reconciling the pin without a
+# source change pays for a rebuild it did not need, and that happens once.
+RUN set -eu; \
+    mkdir -p /out/bin /out/share; \
+    install -m 0755 target/release/host /out/bin/kswarm-zkvm-reducer; \
+    built="$(/out/bin/kswarm-zkvm-reducer image-id)"; \
+    pinned="$(tr -d '[:space:]' < IMAGE_ID)"; \
+    if [ "${built}" != "${pinned}" ]; then \
+      echo "guest image id drift: built ${built}, protocol/zkvm-reducer/IMAGE_ID pins ${pinned}" >&2; \
+      echo "the pinned RISC Zero components or the guest source changed; see protocol/zkvm-reducer/IMAGE_ID.md" >&2; \
+      exit 1; \
+    fi; \
+    printf '%s\n' "${built}" > /out/share/kswarm-zkvm-image-id; \
+    echo "branch canonicalization guest image id ${built}"
 
 # --- builder: locked virtualenv ------------------------------------------------
 FROM ${PYTHON_IMAGE} AS builder
@@ -95,7 +167,25 @@ LABEL org.opencontainers.image.title="kswarm" \
       org.opencontainers.image.vendor="${VENDOR}"
 
 # --- targets ---------------------------------------------------------------------
-FROM runtime AS branch-worker
+
+# The two images on the proof path. The aggregator and the CLI do not carry the
+# prover: the aggregator's proof is produced by a Bonsol node, and the CLI proves
+# nothing, so neither needs a 150 MB binary or the attack surface of one.
+FROM runtime AS proving-runtime
+USER root
+COPY --from=zkvm-builder --chown=root:root /out/bin/kswarm-zkvm-reducer /opt/kswarm/bin/kswarm-zkvm-reducer
+COPY --from=zkvm-builder --chown=root:root /out/share/kswarm-zkvm-image-id /opt/kswarm/share/kswarm-zkvm-image-id
+RUN chmod 0755 /opt/kswarm/bin/kswarm-zkvm-reducer && chmod 0644 /opt/kswarm/share/kswarm-zkvm-image-id
+USER 10001:10001
+# Proving and verifying are on by default in these images, and the guest they accept
+# is the one this image was built with. An operator can still point either variable
+# somewhere else, or unset KSWARM_ZKVM_HOST to turn the proof path off.
+ENV KSWARM_ZKVM_HOST=/opt/kswarm/bin/kswarm-zkvm-reducer \
+    KSWARM_ZKVM_IMAGE_ID_FILE=/opt/kswarm/share/kswarm-zkvm-image-id
+# The binary must run, and it must be the guest the file names, before anything ships.
+RUN test "$(/opt/kswarm/bin/kswarm-zkvm-reducer image-id)" = "$(cat /opt/kswarm/share/kswarm-zkvm-image-id)"
+
+FROM proving-runtime AS branch-worker
 ENV KSWARM_WORKER_METRICS_HOST=0.0.0.0 \
     KSWARM_WORKER_METRICS_PORT=9461
 EXPOSE 9461
@@ -103,7 +193,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9461/metrics', timeout=3)"]
 ENTRYPOINT ["kswarm-branch-worker"]
 
-FROM runtime AS verifier-worker
+FROM proving-runtime AS verifier-worker
 ENV KSWARM_WORKER_METRICS_HOST=0.0.0.0 \
     KSWARM_WORKER_METRICS_PORT=9462
 EXPOSE 9462

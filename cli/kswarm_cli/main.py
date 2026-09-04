@@ -12,12 +12,15 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 
 from kswarm_cli.config import CLUSTER_ENV, cluster_path, predict_runs_dir, save_cluster
+from kswarm_cli.aggregate import (
+    AggregateError,
+    aggregate_journal,
+    build_aggregate_artifact,
+)
 from kswarm_cli.bonsol import (
     FRAMING_RULE,
     IMAGE_ID_ENV,
     PUBLIC_INPUT_RULE,
-    framed_input_digest,
-    try_bind_aggregate_input,
     resolve_aggregate_image_id,
 )
 from kswarm_cli.constants import (
@@ -1069,14 +1072,26 @@ def predict_open(
         "--aggregate-image-id",
         help=f"Bonsol reducer image id (32-byte hex) for the aggregate job. Defaults to ${IMAGE_ID_ENV}, then the checked-in id.",
     ),
-    defer_aggregate_open: bool = typer.Option(False, "--defer-aggregate-open", help="Create branch jobs and manifest now; open the aggregate job later."),
+    defer_aggregate_open: bool = typer.Option(
+        False,
+        "--defer-aggregate-open",
+        help="Accepted and ignored: the aggregate job is always opened later, by predict bind-aggregate.",
+    ),
 ) -> None:
-    """Open a parent prediction run and its branch and aggregate jobs.
+    """Open a parent prediction run and its branch jobs.
+
+    The aggregate job is planned here and opened by `predict bind-aggregate` once the
+    branches have settled. It cannot be opened now: `open_job` fixes a job's
+    `input_bundle_hash` and `expected_result_hash` for good, and both are functions of
+    the branch receipts, which do not exist until the branches run. Opening it now
+    would fund a job that no Bonsol marker could ever match.
 
     The run manifest is written before the first transaction and after every
     confirmed one. If the command stops early, `predict resume <parent-run>`
     continues it and `predict cancel <parent-run>` unwinds the opened jobs.
     """
+
+    del defer_aggregate_open  # every run defers now; the flag is kept for older callers
 
     try:
         validate_output_kind(output_kind)
@@ -1174,8 +1189,15 @@ def predict_open(
             }
         )
 
-    aggregate_input = {
-        "schema_version": 2,
+    # The aggregate PLAN, not the aggregate job's input artifact. The artifact the
+    # reducer consumes carries the branch receipts, which do not exist yet, and
+    # `open_job` fixes `input_bundle_hash` and `expected_result_hash` for good. So the
+    # aggregate job is opened later, by `predict bind-aggregate`, once its branches have
+    # settled. The plan is pinned now as provenance: it names the branch jobs, the
+    # combiner and the reducer image this run committed to before any branch ran.
+    aggregate_plan = {
+        "schema_version": 3,
+        "parent_run": str(aggregate_job),
         "parent_manifest_cid": parent_manifest_cid,
         "branch_jobs": [{"branch_index": item["branch_index"], "job": item["job"], "nonce": item["nonce"], "input_cid": item["input_cid"]} for item in branch_jobs],
         "combiner": combiner,
@@ -1183,28 +1205,23 @@ def predict_open(
         "output_schema_hash": output_schema_hash,
         "bonsol": {"image_id": image_id.hex(), "public_input": PUBLIC_INPUT_RULE, "framing": FRAMING_RULE},
     }
-    aggregate_input_bytes = _canonical_json_bytes(aggregate_input)
-    aggregate_input_cid = _ipfs_add_bytes(ipfs_url, "aggregate-input.json", aggregate_input_bytes)
-    binding, unbound_reason = try_bind_aggregate_input(image_id, aggregate_input_bytes)
+    aggregate_plan_cid = _ipfs_add_bytes(ipfs_url, "aggregate-plan.json", _canonical_json_bytes(aggregate_plan))
     aggregate_entry = {
         "kind": "aggregate",
         "branch_index": None,
         "nonce": aggregate_nonce,
         "job": str(aggregate_job),
-        "input_cid": aggregate_input_cid,
-        # The framed artifact digest is a hash of the CLI's own bytes, so it holds
-        # whatever the reducer does. Only the journal hash needs the reducer's rule,
-        # and it is left unset when the reducer would reject the input. The software
-        # digest gates who may claim the job, which settlement does not affect.
-        "input_bundle_hash": framed_input_digest(aggregate_input_bytes).hex(),
-        "expected_result_hash": binding.journal_hash.hex() if binding else ZERO_HASH.hex(),
+        # Filled in by `predict bind-aggregate` from the settled branch receipts.
+        "input_cid": None,
+        "input_bundle_hash": None,
+        "expected_result_hash": None,
         "job_class": "aggregate-proof",
         "required_capability": "branch-aggregator-bonsol",
         "required_software_digest": image_id.hex(),
         "reward_amount": aggregate_reward_amount,
         "required_stake": aggregate_stake_amount,
         "challenge_bond": aggregate_stake_amount,
-        "status": JOB_DEFERRED if defer_aggregate_open else JOB_PLANNED,
+        "status": JOB_DEFERRED,
     }
 
     run: dict[str, Any] = {
@@ -1219,11 +1236,14 @@ def predict_open(
         "ipfs_api_url": ipfs_url,
         "parent_manifest_cid": parent_manifest_cid,
         "parent_manifest": parent_manifest,
-        "aggregate_input_cid": aggregate_input_cid,
+        "aggregate_plan_cid": aggregate_plan_cid,
+        "aggregate_plan": aggregate_plan,
+        "aggregate_input_cid": None,
         "aggregate_job": str(aggregate_job),
         "aggregate_nonce": aggregate_nonce,
         "aggregate": aggregate_entry,
-        "bonsol": binding.to_json() if binding else {"bound": False, "reason": unbound_reason, "image_id": image_id.hex()},
+        "aggregate_image_id": image_id.hex(),
+        "bonsol": {"bound": False, "reason": "aggregate job is opened by predict bind-aggregate", "image_id": image_id.hex()},
         "branch_jobs": branch_jobs,
         "combiner": combiner,
         "combiner_parameters": parameters,
@@ -1235,7 +1255,7 @@ def predict_open(
             "challenge_window": challenge_window,
         },
         "aggregate_submitted": False,
-        "aggregate_open_deferred": defer_aggregate_open,
+        "aggregate_open_deferred": True,
         "created_at_unix": int(time.time()),
         "updated_at_unix": int(time.time()),
     }
@@ -1245,17 +1265,12 @@ def predict_open(
     _assert_jobs_absent(rpc, [entry["job"] for entry in run_job_entries(run)])
     save_run_manifest(path, run)
     _announce_run(run, path)
-    if binding is None:
-        # No binding exists, so writing one would fund a job that can never settle.
-        # Open the aggregate unbound and say so, after the contract line above.
-        typer.echo(
-            f"warning: aggregate job opened UNBOUND: the reducer image {image_id.hex()} "
-            f"rejects the aggregate input ({unbound_reason}), so expected_result_hash is "
-            "unset and the job cannot be settled by settle_aggregate_proof_job until an "
-            "aggregate reducer that consumes this artifact exists. The branch jobs in "
-            "this run are unaffected.",
-            err=True,
-        )
+    typer.echo(
+        f"aggregate job {aggregate_job} is planned, not opened: its input artifact carries the "
+        "branch receipts, which do not exist yet. Run `kswarm predict bind-aggregate "
+        f"{aggregate_job}` once the branches have settled.",
+        err=True,
+    )
     _drive_run_open(rpc, signer, proto, run, path)
     emit(c, _run_open_payload(run, path))
 
@@ -1292,6 +1307,222 @@ def predict_resume(
     _announce_run(run, path)
     _drive_run_open(rpc, signer, proto, run, path)
     emit(c, _run_open_payload(run, path))
+
+
+@predict_app.command("bind-aggregate")
+def predict_bind_aggregate(
+    ctx: typer.Context,
+    parent_run: str = typer.Argument(..., help="Parent run pubkey printed by predict open."),
+    customer: str | None = typer.Option(None, "--as", help="Customer wallet name. Defaults to the wallet recorded in the run manifest."),
+    allow_completed_branches: bool = typer.Option(
+        False,
+        "--allow-completed-branches",
+        help="Bind against branches that are Completed and attested but not yet settled.",
+    ),
+    aggregate_image_id: str | None = typer.Option(
+        None,
+        "--aggregate-image-id",
+        help=f"Bonsol aggregate reducer image id (32-byte hex). Defaults to ${IMAGE_ID_ENV}, then the checked-in pin.",
+    ),
+    ipfs_api_url: str | None = typer.Option(None, "--ipfs-api-url", help="Override local IPFS API URL."),
+) -> None:
+    """Open the run's aggregate job, bound to the artifact its branch receipts produce.
+
+    The artifact carries every branch's on-chain receipt bytes. The aggregate reducer
+    guest rehashes those bytes, decodes the branch values out of them, applies the
+    combiner and commits the result, so the journal this command predicts is a claim
+    about receipts that already settled -- not about a summary anyone typed.
+
+    `open_job` fixes `input_bundle_hash` and `expected_result_hash` for good, so this
+    is the moment the aggregate job becomes provable. If the prediction here and the
+    guest's reduction ever disagreed, `settle_aggregate_proof_job` would refuse the
+    marker forever; `cli/tests/test_aggregate_artifact.py` and
+    `protocol/bonsol-aggregate-reducer/tests/cross_language_vectors.rs` pin both to one
+    set of vectors so they cannot.
+    """
+
+    c = _ctx(ctx)
+    run, path = _load_predict_run(parent_run)
+    if run["cluster"] != c.cluster_name:
+        raise typer.BadParameter(f"run belongs to cluster {run['cluster']!r}; pass --cluster {run['cluster']}")
+    entry = run.get("aggregate")
+    if entry is None:
+        raise typer.BadParameter("run manifest has no aggregate job")
+    if job_entry_status(entry) == JOB_COMMITTED:
+        emit(c, {"status": "already-bound", **_run_open_payload(run, path)})
+        return
+    if job_entry_status(entry) not in {JOB_DEFERRED, JOB_PLANNED, JOB_OPENED}:
+        raise typer.BadParameter(f"aggregate job is {job_entry_status(entry)!r}; nothing to bind")
+
+    try:
+        image_id = resolve_aggregate_image_id(aggregate_image_id, os.environ)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    rpc = _rpc(c)
+    proto, _ = _payment_context(c, rpc)
+    signer = load_wallet(customer or str(run["customer_wallet"]))
+    if str(signer.pubkey) != run["customer"]:
+        raise typer.BadParameter(f"wallet {signer.name} is {signer.pubkey}, not the run customer {run['customer']}")
+    ipfs_url = _ipfs_api_url(ipfs_api_url or run.get("ipfs_api_url"))
+    _ipfs_check(ipfs_url)
+
+    branches = _collect_branch_receipts(rpc, run, allow_completed_branches)
+    plan_cid = _check_against_aggregate_plan(ipfs_url, run, branches, image_id)
+    manifest = run["parent_manifest"]
+    parameters = dict(run["combiner_parameters"])
+    if run["combiner"] == "majority-vote":
+        dictionary = manifest.get("output_schema", {}).get("category_dictionary")
+        if not isinstance(dictionary, list) or not dictionary:
+            raise typer.BadParameter("majority-vote runs need parent_manifest.output_schema.category_dictionary")
+        parameters["category_dictionary_size"] = len(dictionary)
+
+    try:
+        artifact = build_aggregate_artifact(
+            parent_run=run["parent_run"],
+            parent_manifest_cid=run["parent_manifest_cid"],
+            output_schema_hash=manifest["output_schema_hash"],
+            combiner=run["combiner"],
+            combiner_parameters=parameters,
+            branches=branches,
+            aggregate_plan_cid=plan_cid,
+        )
+        journal = aggregate_journal(artifact)
+    except AggregateError as exc:
+        # No binding exists, so opening the job would fund one that can never settle.
+        raise typer.BadParameter(f"the aggregate reducer would reject this artifact: {exc}") from exc
+
+    aggregate_input_cid = _ipfs_add_bytes(ipfs_url, "aggregate-input.json", artifact)
+    entry["input_cid"] = aggregate_input_cid
+    entry["input_bundle_hash"] = journal.input_digest.hex()
+    entry["expected_result_hash"] = journal.journal_hash.hex()
+    entry["required_software_digest"] = image_id.hex()
+    entry["status"] = JOB_PLANNED
+    run["aggregate_input_cid"] = aggregate_input_cid
+    run["aggregate_image_id"] = image_id.hex()
+    run["bonsol"] = {
+        "bound": True,
+        "image_id": image_id.hex(),
+        "public_input": PUBLIC_INPUT_RULE,
+        "framing": FRAMING_RULE,
+        **journal.to_json(),
+    }
+    run["status"] = RUN_OPENING
+    run["updated_at_unix"] = int(time.time())
+    save_run_manifest(path, run)
+    _announce_run(run, path)
+    _assert_jobs_absent(rpc, [entry["job"]])
+    _drive_run_open(rpc, signer, proto, run, path)
+    emit(c, _run_open_payload(run, path))
+
+
+def _collect_branch_receipts(rpc: RpcClient, run: dict[str, Any], allow_completed: bool) -> list[dict[str, Any]]:
+    """The on-chain receipt bytes of every branch, or a refusal naming the branch.
+
+    The bytes come from the branch job accounts, not from IPFS: `submitted_result_hash`
+    is `sha256(result_bytes)`, so binding the aggregate to these bytes binds it to what
+    the chain already accepted.
+    """
+
+    settled = JOB_STATUS_BY_NAME["settled"]
+    completed = JOB_STATUS_BY_NAME["submitted"]
+    branches: list[dict[str, Any]] = []
+    for item in run["branch_jobs"]:
+        job_key = Pubkey.from_string(item["job"])
+        job = fetch_job(rpc, job_key)
+        if job is None:
+            raise typer.BadParameter(f"branch {item['branch_index']} job {job_key} does not exist")
+        ready = job.status == settled or (allow_completed and job.status == completed and job.verifier_attestation_hash is not None)
+        if not ready:
+            raise typer.BadParameter(
+                f"branch {item['branch_index']} job {job_key} is {JOB_STATUS.get(job.status, job.status)!r}; "
+                "aggregate binding needs every branch settled (or --allow-completed-branches with an attestation)"
+            )
+        if not job.result_bytes:
+            raise typer.BadParameter(f"branch {item['branch_index']} job {job_key} carries no receipt bytes")
+        if sha256(bytes(job.result_bytes)) != job.submitted_result_hash:
+            raise typer.BadParameter(
+                f"branch {item['branch_index']} job {job_key}: on-chain result_bytes do not hash to submitted_result_hash"
+            )
+        branches.append(
+            {
+                "branch_index": int(item["branch_index"]),
+                "job": str(job_key),
+                "output_cid": job.output_cid,
+                "result_bytes": bytes(job.result_bytes).hex(),
+                "weight": 1,
+            }
+        )
+    return branches
+
+
+def _check_against_aggregate_plan(
+    ipfs_url: str,
+    run: dict[str, Any],
+    branches: list[dict[str, Any]],
+    image_id: bytes,
+) -> str | None:
+    """Refuse a binding that departs from the plan `predict open` pinned.
+
+    `open_job` fixes the aggregate job's hashes at bind time, which is after every
+    branch result is visible. Without this check the combiner, its parameters and the
+    branch set are whatever the local run manifest says at that moment, and nothing
+    outside this machine records what the run committed to beforehand. The plan is
+    content-addressed and was pinned before any branch ran, so comparing against it --
+    and carrying its CID inside the artifact, where `input_bundle_hash` commits it --
+    is what makes the answer checkable by someone who did not run this command.
+
+    A run with no pinned plan (an older manifest) is allowed through with a warning
+    rather than refused: the plan is provenance, and refusing would strand a run that
+    was opened before the field existed.
+    """
+
+    plan_cid = run.get("aggregate_plan_cid")
+    if not plan_cid:
+        typer.echo(
+            "warning: this run has no pinned aggregate plan, so the combiner and the branch set "
+            "cannot be checked against what it committed to before its branches ran",
+            err=True,
+        )
+        return None
+
+    try:
+        plan = _ipfs_cat_json(ipfs_url, str(plan_cid))
+    except Exception as exc:  # noqa: BLE001 - any fetch failure is a refusal
+        raise typer.BadParameter(
+            f"cannot read the pinned aggregate plan {plan_cid}: {exc}. The plan is what says which "
+            "combiner and which branches this run committed to before its branches ran; binding "
+            "without it would fix the job's hashes against an unrecorded choice."
+        ) from exc
+
+    differences: list[str] = []
+    if plan.get("combiner") != run["combiner"]:
+        differences.append(f"combiner {run['combiner']!r} is not the planned {plan.get('combiner')!r}")
+    if dict(plan.get("combiner_parameters") or {}) != dict(run["combiner_parameters"]):
+        differences.append(
+            f"combiner_parameters {dict(run['combiner_parameters'])!r} are not the planned "
+            f"{dict(plan.get('combiner_parameters') or {})!r}"
+        )
+    planned_image = str((plan.get("bonsol") or {}).get("image_id", ""))
+    if planned_image and planned_image != image_id.hex():
+        differences.append(f"reducer image {image_id.hex()} is not the planned {planned_image}")
+    planned_jobs = [str(item["job"]) for item in (plan.get("branch_jobs") or [])]
+    bound_jobs = [str(item["job"]) for item in branches]
+    if planned_jobs and planned_jobs != bound_jobs:
+        missing = [job for job in planned_jobs if job not in bound_jobs]
+        extra = [job for job in bound_jobs if job not in planned_jobs]
+        detail = []
+        if missing:
+            detail.append(f"missing {missing}")
+        if extra:
+            detail.append(f"extra {extra}")
+        differences.append("branch set is not the planned set" + (": " + ", ".join(detail) if detail else ""))
+    if differences:
+        raise typer.BadParameter(
+            "this binding departs from the aggregate plan pinned at "
+            f"{plan_cid} before any branch ran: " + "; ".join(differences)
+        )
+    return str(plan_cid)
 
 
 @predict_app.command("status")
@@ -1385,7 +1616,10 @@ def predict_cancel(
         job_key = Pubkey.from_string(entry["job"])
         job = fetch_job(rpc, job_key)
         if job is None:
-            if job_entry_status(entry) in PENDING_JOB_STATUSES:
+            # A deferred aggregate never reached the chain either, so cancelling the run
+            # must retire it in the manifest; otherwise `predict bind-aggregate` would
+            # still offer to open it against branches that were cancelled.
+            if job_entry_status(entry) in PENDING_JOB_STATUSES or job_entry_status(entry) == JOB_DEFERRED:
                 entry["status"] = JOB_CANCELLED
             continue
         if job.status in {JOB_STATUS_BY_NAME["awaiting-artifact"], JOB_STATUS_BY_NAME["open"]}:
@@ -1422,19 +1656,29 @@ def inspect_worker(ctx: typer.Context, pubkey: str = typer.Argument(..., help="W
 @inspect_app.command("marker")
 def inspect_marker(
     ctx: typer.Context,
-    execution_id: str = typer.Argument(..., help="Bonsol execution id or 32-byte hex id."),
+    execution_id: str | None = typer.Argument(None, help="Bonsol execution id or 32-byte hex id."),
     image_id: str | None = typer.Option(None, "--image-id", help="Optional image id hex filter."),
+    job: str | None = typer.Option(None, "--job", help="Aggregate job pubkey. Lists every marker recorded for that job."),
 ) -> None:
     """Inspect BonsolAggregateVerification marker PDAs.
 
+    By execution id, or by job when the caller knows which job it funded but not which
+    execution proved it -- the execution id is chosen by whatever requested the proof.
+
     Example: kswarm inspect marker p0b-happy-1700000000
+    Example: kswarm inspect marker --job <aggregate-job>
     """
     c = _ctx(ctx)
-    execution = parse_hash(execution_id)
+    if (execution_id is None) == (job is None):
+        raise typer.BadParameter("pass an execution id or --job, not both and not neither")
+    execution = parse_hash(execution_id) if execution_id else None
+    aggregate_job = Pubkey.from_string(job) if job else None
     image = parse_hash(image_id) if image_id else None
     rows = []
     for pubkey, marker in fetch_all_markers(_rpc(c), _program_id(c)):
-        if marker.execution_id != execution:
+        if execution is not None and marker.execution_id != execution:
+            continue
+        if aggregate_job is not None and marker.aggregate_job != aggregate_job:
             continue
         if image and marker.image_id != image:
             continue

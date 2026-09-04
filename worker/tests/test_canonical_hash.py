@@ -26,8 +26,18 @@ def test_canonical_json_round_trips(value: object) -> None:
     encoded = canonical_json_bytes(value)
 
     assert encoded == canonical_json_bytes(json.loads(encoded.decode("utf-8")))
-    assert b": " not in encoded
-    assert b", " not in encoded
+
+
+def test_canonical_json_uses_compact_separators() -> None:
+    """No space after `:` or `,`.
+
+    Asserted on a document with known keys rather than by searching an arbitrary
+    encoding for `", "`: a *string value* may legitimately contain that sequence, and
+    the old substring search failed on `{", ": null}`.
+    """
+
+    assert canonical_json_bytes({"b": 1, "a": [1, 2]}) == b'{"a":[1,2],"b":1}'
+    assert canonical_json_bytes({", ": None}) == b'{", ":null}'
 
 
 @given(st.dictionaries(st.text(min_size=1, max_size=8), json_scalars, min_size=1, max_size=8))

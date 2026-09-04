@@ -1,45 +1,24 @@
+//! The branch canonicalization guest.
+//!
+//! It is handed one branch output document and recomputes the receipt the worker
+//! claimed: canonical JSON of the hash preimage, the canonical hash, the `MFB2`
+//! encoding, and `sha256` of that encoding. It commits
+//! `input_digest || result_hash || output_len`.
+//!
+//! The rules live in `kswarm_bonsol_aggregate_reducer::branch_receipt`, so the guest,
+//! the host verifier and the Python verifier share one definition.
+//!
+//! A malformed document aborts the guest, so there is no receipt for a document the
+//! worker could not have produced.
+
+use kswarm_bonsol_aggregate_reducer::branch_receipt::branch_receipt_journal;
 use risc0_zkvm::guest::env;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ReducerInput {
-    branch_key: String,
-    child_job_id: String,
-    line_count: u32,
-    parent_request_id: String,
-    score_hex: String,
-    word_count: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ReducerJournal {
-    branch_key: String,
-    child_job_id: String,
-    line_count: u32,
-    parent_request_id: String,
-    reducer_digest: String,
-    score_hex: String,
-    word_count: u32,
-}
 
 fn main() {
-    let input: ReducerInput = env::read();
-    let mut hasher = Sha256::new();
-    hasher.update(input.branch_key.as_bytes());
-    hasher.update(input.child_job_id.as_bytes());
-    hasher.update(input.parent_request_id.as_bytes());
-    hasher.update(input.score_hex.as_bytes());
-    hasher.update(input.line_count.to_le_bytes());
-    hasher.update(input.word_count.to_le_bytes());
-    let journal = ReducerJournal {
-        branch_key: input.branch_key,
-        child_job_id: input.child_job_id,
-        line_count: input.line_count,
-        parent_request_id: input.parent_request_id,
-        reducer_digest: format!("{:x}", hasher.finalize()),
-        score_hex: input.score_hex,
-        word_count: input.word_count,
+    let payload: Vec<u8> = env::read();
+    let journal = match branch_receipt_journal(&payload) {
+        Ok(journal) => journal,
+        Err(error) => panic!("branch output rejected: {error}"),
     };
-    env::commit(&journal);
+    env::commit_slice(&journal.journal_bytes());
 }

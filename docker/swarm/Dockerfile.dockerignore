@@ -11,10 +11,21 @@
 !backend/app/utils/llm_client.py
 !docker/swarm/pyproject.toml
 !docker/swarm/uv.lock
+# The zkVM branch canonicalization guest and the host that verifies it. The shared
+# reducer crate is a path dependency of both, so both directories have to enter.
+!protocol/zkvm-reducer/
+!protocol/bonsol-aggregate-reducer/
+# Named in full rather than by a `**/target` glob: `bonsol build` leaves a root-owned
+# `target/` in the guest crates, the context sender fails on it with "permission
+# denied", and the glob did not exclude it at this depth. Nothing in `target/` belongs
+# in an image anyway; the stage builds its own.
+protocol/zkvm-reducer/target
+protocol/bonsol-aggregate-reducer/target
 # Never needed inside an image.
 **/__pycache__/
 **/*.pyc
 **/.venv/
 **/.pytest_cache/
 **/tests/
+**/target
 cli/uv.lock

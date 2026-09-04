@@ -35,7 +35,7 @@ The Swarm Protocol turns that engine into an open network: many independent oper
 6. **Receipt.** The worker publishes the output and transcript to IPFS, then calls `submit_receipt`. The job becomes `completed` and the challenge window starts.
 7. **Verify.** A verifier re-executes the same branch with the same model and seed, then submits an attestation carrying its own result hash.
 8. **Settle or challenge.** After the challenge window, `settle_job` pays the reward and unlocks the stake. If the assigned verifier's result differs, `challenge_job` slashes the stake instead.
-9. **Aggregate.** The aggregate job combines the branch results. The on-chain gate is real: `settle_aggregate_proof_job` pays only when a Bonsol proof marker is verified on-chain and a matching attestation exists. **In this release your aggregate job does not reach that gate.** The reducer image the CLI names cannot read the aggregate input document, so `predict open` opens the aggregate job unbound and warns, and no running process checks an off-chain EZKL proof or zkVM receipt against the result it claims. See section 3, "Status and what to expect", before you rely on either.
+9. **Aggregate.** Once the branches settle you run `kswarm predict bind-aggregate <parent-run>`. That builds the aggregate input from the branch receipts the chain already accepted, works out the journal the reducer will commit, and opens the aggregate job bound to both. An aggregator then proves the reduction through Bonsol. `settle_aggregate_proof_job` pays only when the proof marker is on chain and a matching attestation exists. The aggregate job is not opened by `predict open`, because its input carries the branch receipts and those do not exist until the branches run.
 10. **Report.** `predict report` returns the aggregate value and branch narratives.
 
 Every job reaches exactly one terminal state. Three escape paths stop money from locking forever: `cancel_open_job` for a job nobody claimed, `slash_stale_job` for a claim with no receipt, and `cancel_aggregate_proof_job` when the aggregate proof never lands.
@@ -49,10 +49,11 @@ The chain plumbing is real and runs end to end on a local validator: escrow, sta
 | Escrow, stake, claim, settle, slash | Works. Covered by integration and unit tests. |
 | Verifier re-execution | The default. Hash-only checking survives only behind `VERIFIER_HASH_ONLY=1`. |
 | Challenge authorization | Only the verifier the customer or admin assigned may challenge. |
-| Aggregate settlement gate | Proof-gated on-chain through Bonsol. Sound. |
-| zkVM guests | They hash the values they are given; they do not recompute them from the source text. A proof says "the guest saw these values", not "these values are true". The EZKL branch proof is a fixed two-input linear function, off-chain only: research tooling. |
-| Aggregate settlement in practice | The checked-in reducer image cannot read the aggregate input document, so `predict open` opens the aggregate job unbound and warns. Branch jobs are unaffected. |
-| Off-chain proof checking | Nothing runs it. The rules that bind an EZKL proof or a zkVM receipt to the result it claims are implemented and tested, but the only component that called them was the Node worker, retired in this release. The verifier re-executes the branch instead, which catches a fabricated result but is not proof verification. |
+| Aggregate settlement gate | Proof-gated on-chain through Bonsol. Sound, and now reached: `predict bind-aggregate` opens the aggregate job bound to the artifact its branch receipts produce. |
+| What the aggregate proof says | The guest recomputes. It rehashes every branch receipt in the artifact, decodes the branch values out of those bytes, applies the combiner with its committed parameters, and commits the result and a Merkle root over the branch hashes. Those hashes are the `submitted_result_hash` values already on chain, so anyone can check which branches were reduced. |
+| Branch receipts | A worker with `KSWARM_ZKVM_HOST` set proves that its published output document encodes to exactly the receipt it submitted, and the verifier checks that proof before it attests. This catches a worker that publishes one document and settles another, which re-execution cannot. Proving costs minutes of CPU, so it is opt-in per worker. |
+| The language model step | Not proven, and not provable today. It is secured by re-execution plus challenge and slashing: an economic guarantee, not a cryptographic one. |
+| EZKL branch proof | Research tooling, off the release path. Its model is a fixed two-input linear function that is not a submodel of anything kswarm runs. |
 | Settle daemon | None in the Python stack. Branch jobs stay `completed` until somebody runs `kswarm settle <job>`. |
 
 ### Release path
@@ -215,6 +216,8 @@ kswarm worker stake 100000 --as verifier
 
 **Re-execution.** The daemon re-runs the branch with the same model, prompt, and seed, then compares its own canonical commitment with the worker's receipt.
 
+**Receipt verification.** With `KSWARM_ZKVM_HOST` set, the daemon also verifies the branch's zero-knowledge receipt and binds it to the job: the proof must be over this job's input and the worker's published output, and its result hash must be the one on chain. If re-execution agrees but the receipt does not, the daemon refuses to attest at all, because attesting would let the job settle on a receipt whose proof does not hold.
+
 ```bash
 kswarm attest <job> --result-hash <hex> --evidence-cid <cid> \
   --software-digest worker-canonical --as verifier
@@ -241,7 +244,7 @@ kswarm worker register --as aggregator \
 kswarm worker stake 50000 --as aggregator
 ```
 
-Set `KSWARM_BONSOL_AGGREGATE_COMMAND` to a hook that runs the reducer over exactly the committed input artifact, framed with a little-endian 64-bit length prefix. Without that hook the aggregate receipt cannot settle on chain. Settlement is `kswarm settle-aggregate <aggregate-job>`.
+Set `KSWARM_BONSOL_AGGREGATE_COMMAND` to a hook that asks a Bonsol node to run the aggregate reducer over exactly the committed input artifact, framed with a little-endian 64-bit length prefix; `protocol/scripts/bonsol-aggregate-hook.py` is the reference. Without that hook the runner will not claim an aggregate job at all, because the receipt could never be proven and the job could never settle. Settlement is `kswarm settle-aggregate <aggregate-job>`.
 
 Note the limit from section 3: the checked-in reducer image cannot read the aggregate input document, so a run opened with the default image cannot settle. Point `--aggregate-image-id` at a reducer whose input is the aggregate artifact, or use `--defer-aggregate-open` and bind the aggregate job yourself.
 
@@ -309,7 +312,7 @@ No. The protocol uses the existing KAI mint, whose mint and freeze authorities a
 No. There is no mainnet program id, and the CLI refuses on-chain commands on the `mainnet` profile for that reason. Devnet is next, then the external audit.
 
 **Why did my aggregate job never settle?**
-Most likely the reducer limit in section 3: the default image cannot read the aggregate input document, so the job is opened unbound and warns. Twenty-four hours after the challenge window closes, the customer can cancel it and recover the escrow.
+Check three things in order. The aggregate job is opened by `kswarm predict bind-aggregate`, not by `predict open`, so it may simply not exist yet. If it exists and is `completed`, the Bonsol proof may not have landed: the aggregator needs `KSWARM_BONSOL_AGGREGATE_COMMAND` and a reachable Bonsol node. If the proof landed but settlement is refused, the verifier attestation is missing. Twenty-four hours after the challenge window closes, the customer can cancel the job and recover the escrow, and the worker's stake unlocks without a slash.
 
 **Why is my branch job stuck at `completed`?**
 The Python stack has no settle daemon, so after the challenge window somebody has to call `kswarm settle <job>`. The Node watcher does it automatically if you run that stack.

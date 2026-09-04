@@ -19,6 +19,10 @@ edition = "2024"
 # that raised their MSRV past it: ruint 1.20.0 needs rustc 1.90 and
 # enum-ordinalize 4.4.2 needs 1.89, and the guest build fails outright on both.
 # Raise them only together with the rzup Rust toolchain.
+# The proof-layer rules live in one crate so the guest, the host verifier and the
+# Python verifier cannot drift. This is a native `risc0-build` guest build (no docker
+# context), so a path dependency outside this directory is fine here; the Bonsol
+# aggregate guest cannot do the same, which is why that crate holds both.
+kswarm_bonsol_aggregate_reducer = { path = "../../../bonsol-aggregate-reducer", default-features = false, features = ["std"] }
 risc0-zkvm = { version = "=3.0.3", default-features = false, features = ["std"] }
 serde = { version = "1.0", features = ["derive"] }
-sha2 = { version = "0.10", default-features = false }

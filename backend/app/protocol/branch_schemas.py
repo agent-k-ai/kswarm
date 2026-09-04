@@ -59,6 +59,10 @@ class BranchOutput(BaseModel):
     llm_version_hash: str
     completed_at_unix: int = Field(ge=0)
     transcript_cid: str
+    # IPFS locator of the zkVM branch canonicalization receipt, when the worker proved
+    # one. It names a proof taken over this document, so it cannot be inside the proof
+    # and it is excluded from the canonical hash preimage below.
+    zkvm_receipt_cid: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_output_shape(self) -> "BranchOutput":
@@ -90,11 +94,15 @@ class BranchOutput(BaseModel):
 
         `narrative_text` is excluded by ADR Decision 6. `completed_at_unix` is
         also excluded because an honest verifier re-executes later.
+        `zkvm_receipt_cid` is excluded because the receipt it names is a proof over
+        this document: including it would make the document depend on its own proof,
+        and the guest is shown the document without it.
         """
 
         data = self.model_dump(mode="json", exclude_none=False)
         data.pop("narrative_text", None)
         data.pop("completed_at_unix", None)
+        data.pop("zkvm_receipt_cid", None)
         return data
 
 

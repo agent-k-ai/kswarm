@@ -1,26 +1,27 @@
-"""Bonsol aggregate-proof binding, computed the way the callback harness computes it.
+"""The legacy branch-reducer binding, computed the way the callback harness computes it.
 
-`settle_aggregate_proof_job` (solana/programs/kswarm_protocol/src/lib.rs) settles
-an aggregate-proof job only when the Bonsol marker's `image_id` equals the job's
-`required_software_digest`, its `input_digest` equals the job's
-`input_bundle_hash`, and its `journal_hash` equals the job's
-`expected_result_hash`. The program derives `journal_hash` as
-`sha256(input_digest || committed_outputs)` from the forwarded Bonsol payload.
+This module mirrors `protocol/bonsol-branch-reducer`, the guest that commits the
+statistics its caller supplied. That guest is not on the aggregate path any more: it
+cannot consume an aggregate artifact, so every aggregate job bound to it was opened
+unbound and could never settle. `kswarm_cli.aggregate` is the live path.
 
-`protocol/bonsol-callback-harness/src/main.rs` (`prepare-production`) is the
-reference client for those three values:
+What is left here is still used:
 
-* `framed_input = u64_le(len(input)) || input` and
-  `input_digest = sha256(framed_input)`; the guest reads the same frame.
-* `committed_outputs = reducer_committed_outputs(input_json)`, a host-side mirror
-  of `protocol/bonsol-branch-reducer/src/lib.rs`, which the guest and the harness
-  both use: `reducer_digest (32) || line_count le32 || word_count le32 || score (32)`.
-* `journal_hash = sha256(input_digest || committed_outputs)`.
+* `framed_input`, `framed_input_digest` and `journal_hash` are the Bonsol framing and
+  journal rules, shared by both guests and by the on-chain program.
+* `parse_image_id` and `resolve_aggregate_image_id` resolve the aggregate reducer image
+  id from the flag, the environment, or the checked-in pin.
+* `decode_score_felt` and `reducer_committed_outputs` mirror the legacy guest for
+  `protocol/bonsol-callback-harness`, which still drives the Bonsol callback,
+  marker-PDA and replay smoke tests. Those semantics do not depend on which guest ran,
+  so the smoke test was left on the guest whose vectors are already recorded.
 
-The aggregator runner (`worker/aggregator_runner`) does not compute these itself;
-its hook contract (`bonsol_hook.py`) re-checks the journal rule and the job
-binding. The functions below therefore mirror the harness, and
-`tests/test_bonsol_binding.py` checks them against vectors the harness produced.
+`settle_aggregate_proof_job` (solana/programs/kswarm_protocol/src/lib.rs) settles an
+aggregate-proof job only when the Bonsol marker's `image_id` equals the job's
+`required_software_digest`, its `input_digest` equals the job's `input_bundle_hash`,
+and its `journal_hash` equals the job's `expected_result_hash`. The program derives
+`journal_hash` as `sha256(input_digest || committed_outputs)` from the forwarded Bonsol
+payload.
 """
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ from __future__ import annotations
 import json
 import struct
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Any
 
 from kswarm_cli.encoding import sha256
@@ -47,31 +47,9 @@ COMMITTED_OUTPUTS_LEN = 32 + 4 + 4 + SCORE_FELT_LEN
 BN254_SCALAR_MODULUS = 0x30644E72E131A029B85045B68181585D2833E84879B9709143E1F593F0000001
 U32_MASK = 0xFFFF_FFFF
 U64_MAX = 0xFFFF_FFFF_FFFF_FFFF
-# The public input of the aggregate job is the job's own input artifact, framed.
+# The public input of an aggregate job is the job's own input artifact, framed.
 PUBLIC_INPUT_RULE = "input-artifact"
 FRAMING_RULE = "u64le-length-prefix"
-
-
-@dataclass(frozen=True)
-class AggregateBinding:
-    """The three job fields plus the reducer outputs they commit to."""
-
-    image_id: bytes
-    input_digest: bytes
-    committed_outputs: bytes
-    output_digest: bytes
-    journal_hash: bytes
-
-    def to_json(self) -> dict[str, str]:
-        return {
-            "image_id": self.image_id.hex(),
-            "input_digest": self.input_digest.hex(),
-            "committed_outputs": self.committed_outputs.hex(),
-            "output_digest": self.output_digest.hex(),
-            "journal_hash": self.journal_hash.hex(),
-            "public_input": PUBLIC_INPUT_RULE,
-            "framing": FRAMING_RULE,
-        }
 
 
 def parse_image_id(value: str) -> bytes:
@@ -88,7 +66,13 @@ def parse_image_id(value: str) -> bytes:
 
 
 def resolve_aggregate_image_id(flag_value: str | None, environ: Mapping[str, str]) -> bytes:
-    """`--aggregate-image-id`, then `KSWARM_AGGREGATE_IMAGE_ID`, then the checked-in default."""
+    """`--aggregate-image-id`, then `KSWARM_AGGREGATE_IMAGE_ID`, then the checked-in pin.
+
+    An unset pin is an error, not a zero id. A zero `required_software_digest` lets any
+    worker claim the aggregate job and lets no Bonsol marker ever match it, so the job
+    would be funded and unsettleable. Rebuild and re-pin with
+    `protocol/scripts/build-aggregate-reducer.sh`.
+    """
 
     if flag_value is not None and flag_value.strip():
         return parse_image_id(flag_value)
@@ -98,6 +82,12 @@ def resolve_aggregate_image_id(flag_value: str | None, environ: Mapping[str, str
             return parse_image_id(env_value)
         except ValueError as exc:
             raise ValueError(f"{IMAGE_ID_ENV}: {exc}") from exc
+    if not AGGREGATE_REDUCER_IMAGE_ID.strip():
+        raise ValueError(
+            "no aggregate reducer image id is pinned: build the guest with "
+            "protocol/scripts/build-aggregate-reducer.sh, or pass --aggregate-image-id / set "
+            f"{IMAGE_ID_ENV}"
+        )
     return parse_image_id(AGGREGATE_REDUCER_IMAGE_ID)
 
 
@@ -187,48 +177,6 @@ def journal_hash(input_digest: bytes, committed_outputs: bytes) -> bytes:
     if not committed_outputs:
         raise ValueError("committed outputs must not be empty")
     return sha256(input_digest + committed_outputs)
-
-
-def bind_aggregate_input(image_id: bytes, input_json: bytes) -> AggregateBinding:
-    """Everything `open_job` needs so the reducer's Bonsol callback can settle the job.
-
-    Raises `ValueError` when the reducer would reject `input_json`, because then no
-    binding exists: any hash written on chain would be one the callback can never
-    produce, and `settle_aggregate_proof_job` would refuse the job forever.
-    """
-
-    if len(image_id) != IMAGE_ID_LEN:
-        raise ValueError(f"image id must be {IMAGE_ID_LEN} bytes")
-    input_digest = framed_input_digest(input_json)
-    committed_outputs = reducer_committed_outputs(input_json)
-    return AggregateBinding(
-        image_id=image_id,
-        input_digest=input_digest,
-        committed_outputs=committed_outputs,
-        output_digest=sha256(committed_outputs),
-        journal_hash=journal_hash(input_digest, committed_outputs),
-    )
-
-
-def try_bind_aggregate_input(image_id: bytes, input_json: bytes) -> tuple[AggregateBinding | None, str]:
-    """`bind_aggregate_input`, or `(None, reason)` when the reducer would reject the input.
-
-    The reducer this binds to is `protocol/bonsol-branch-reducer`, whose input is a
-    single branch's `{branch_key, child_job_id, parent_request_id, line_count,
-    word_count, score_hex}`. `predict open`'s aggregate artifact is a different
-    document -- the branch job list, the combiner and its parameters -- and carries no
-    `score_hex`, so the reducer cannot consume it. Before `fix/proof-binding` the
-    reducer defaulted every missing field and produced a value anyway, so the CLI
-    could write a hash; that hash was never one the reducer would commit for this
-    input. Now the rejection is explicit, and the honest binding is no binding: the
-    caller opens the job unbound (zero digests) and says so, rather than funding a job
-    that provably cannot settle.
-    """
-
-    try:
-        return bind_aggregate_input(image_id, input_json), ""
-    except ValueError as exc:
-        return None, str(exc)
 
 
 def _json_str(value: dict[str, Any], key: str) -> str:

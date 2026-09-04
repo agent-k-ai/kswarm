@@ -1,0 +1,167 @@
+# No service declares a `container_name`. A fixed name is global to the daemon, so
+# `docker compose -p <project>` does not make two of these stacks independent: the
+# second one fails to create a container the first already owns, which is how a
+# reviewer's run collided with another agent's. Compose derives `<project>-<service>-1`
+# instead, which is unique whenever the project is. Anything that needs a specific
+# container resolves it through `docker compose ps -q <service>` or a
+# `com.docker.compose.service` label, never by name.
+
+x-bonsol-eval-image: &bonsol-eval-image
+  image: kswarm-bonsol-eval:local
+  build:
+    context: .
+    dockerfile: docker/bonsol-eval/Dockerfile
+
+services:
+  bonsol-builder:
+    <<: *bonsol-eval-image
+    command: ["/bin/bash", "/app/protocol/scripts/run-bonsol-builder.sh"]
+    environment:
+      BONSOL_SHARED_DIR: /runtime/bonsol
+      BONSOL_RPC_URL: http://bonsol-validator:8899
+      BONSOL_WS_URL: ws://bonsol-validator:8900
+      BONSOL_REPO_DIR: /app
+      DOCKER_BUILDKIT: "1"
+    volumes:
+      - .:/app
+      - /usr/bin/docker:/usr/bin/docker:ro
+      - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${BONSOL_RUNTIME_HOST_DIR:-./runtime/bonsol}:/runtime/bonsol
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "test -f /runtime/bonsol/ready && test -f /runtime/bonsol/bonsol.so && test -f /runtime/bonsol/callback_example.so && test -f /runtime/bonsol/kswarm_protocol.so && test -f /runtime/bonsol/reducer-manifest.json && test -f /runtime/bonsol/aggregate-reducer-manifest.json"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 120
+
+  bonsol-validator:
+    image: anzaxyz/agave:v2.0.13@sha256:8fa22e62c5be2a59d6b76b8845c0b4f8ab046513597bb8bd5b7c8b60c1b90546  # anzaxyz/agave:v2.0.13
+    ulimits:
+      nofile:
+        soft: 1000000
+        hard: 1000000
+    # The kswarm program is loaded UPGRADEABLY with the Bonsol client keypair as its
+    # upgrade authority. `initialize_protocol` accepts only the program's upgrade
+    # authority, and a `--bpf-program` account has no ProgramData and therefore no
+    # upgrade authority at all: the protocol could never be initialized on this
+    # validator. Bonsol's own two programs stay non-upgradeable; nothing checks them.
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - |
+        set -euo pipefail
+        authority="$$(solana-keygen pubkey /runtime/bonsol/client-keypair.json)"
+        exec solana-test-validator \
+          --reset \
+          --limit-ledger-size 100000 \
+          --bind-address 0.0.0.0 \
+          --rpc-pubsub-enable-block-subscription \
+          --bpf-program BoNsHRcyLLNdtnoDf8hiCNZpyehMC4FDMxs6NTxFi3ew /runtime/bonsol/bonsol.so \
+          --bpf-program exay1T7QqsJPNcwzMiWubR6vZnqrgM16jZRraHgqBGG /runtime/bonsol/callback_example.so \
+          --upgradeable-program ERNzRcYhX6UYboXAAP7vwzbCKsULYu21R4RFNvDD8CkM /runtime/bonsol/kswarm_protocol.so "$$authority"
+    depends_on:
+      bonsol-builder:
+        condition: service_healthy
+    volumes:
+      - ${BONSOL_RUNTIME_HOST_DIR:-./runtime/bonsol}:/runtime/bonsol
+    ports:
+      # Loopback by default: a dev validator with no auth should not be on the network.
+      # BONSOL_VALIDATOR_BIND=0.0.0.0 widens it, which the containerized smoke test needs
+      # because the swarm stack runs in a different compose network and reaches this
+      # validator through the host.
+      - "${BONSOL_VALIDATOR_BIND:-127.0.0.1}:${BONSOL_VALIDATOR_RPC_PORT:-28899}:8899"
+      - "${BONSOL_VALIDATOR_BIND:-127.0.0.1}:${BONSOL_VALIDATOR_WS_PORT:-28900}:8900"
+    healthcheck:
+      test: ["CMD-SHELL", "solana -u http://127.0.0.1:8899 block-height >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  bonsol-image-server:
+    image: kswarm-bonsol-eval:local
+    command: ["/opt/bonsol/bin/local-zk-program-server"]
+    depends_on:
+      bonsol-builder:
+        condition: service_healthy
+    ports:
+      - "${BONSOL_IMAGE_SERVER_PORT:-28080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sS http://127.0.0.1:8080 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  bonsol-node:
+    image: kswarm-bonsol-eval:local
+    command: ["/bin/bash", "/app/protocol/scripts/run-bonsol-node.sh"]
+    environment:
+      BONSOL_SHARED_DIR: /runtime/bonsol
+      BONSOL_RPC_URL: http://bonsol-validator:8899
+    depends_on:
+      bonsol-builder:
+        condition: service_healthy
+      bonsol-validator:
+        condition: service_healthy
+      bonsol-image-server:
+        condition: service_started
+    volumes:
+      - .:/app
+      - ${BONSOL_RUNTIME_HOST_DIR:-./runtime/bonsol}:/runtime/bonsol
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f bonsol-node >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  bonsol-smoke-test:
+    image: kswarm-bonsol-eval:local
+    command: ["/bin/bash", "/app/protocol/scripts/run-bonsol-smoke-test.sh"]
+    environment:
+      BONSOL_SHARED_DIR: /runtime/bonsol
+      BONSOL_RPC_URL: http://bonsol-validator:8899
+      BONSOL_IMAGE_SERVER_URL: http://bonsol-image-server:8080
+      BONSOL_REPO_DIR: /app
+    depends_on:
+      bonsol-builder:
+        condition: service_healthy
+      bonsol-validator:
+        condition: service_healthy
+      bonsol-image-server:
+        condition: service_started
+      bonsol-node:
+        condition: service_started
+    volumes:
+      - .:/app
+      - ${BONSOL_RUNTIME_HOST_DIR:-./runtime/bonsol}:/runtime/bonsol
+    profiles:
+      - test
+
+  bonsol-callback-smoke-test:
+    image: kswarm-bonsol-eval:local
+    command: ["/bin/bash", "/app/protocol/scripts/run-bonsol-callback-smoke-test.sh"]
+    environment:
+      BONSOL_SHARED_DIR: /runtime/bonsol
+      BONSOL_RPC_URL: http://bonsol-validator:8899
+      BONSOL_IMAGE_SERVER_URL: http://bonsol-image-server:8080
+      BONSOL_REPO_DIR: /app
+      PHASE0_CALLBACK_TEST_MODE: ${PHASE0_CALLBACK_TEST_MODE:-happy}
+      PHASE0_CALLBACK_EXECUTE_TIMEOUT: ${PHASE0_CALLBACK_EXECUTE_TIMEOUT:-1200}
+      PHASE0_CALLBACK_EXPECTED_FAILURE_TIMEOUT: ${PHASE0_CALLBACK_EXPECTED_FAILURE_TIMEOUT:-300}
+    depends_on:
+      bonsol-builder:
+        condition: service_healthy
+      bonsol-validator:
+        condition: service_healthy
+      bonsol-image-server:
+        condition: service_started
+      bonsol-node:
+        condition: service_started
+    volumes:
+      - .:/app
+      - ${BONSOL_RUNTIME_HOST_DIR:-./runtime/bonsol}:/runtime/bonsol
+    profiles:
+      - callback-test

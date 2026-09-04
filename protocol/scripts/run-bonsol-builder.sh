@@ -6,6 +6,7 @@ rpc_url="${BONSOL_RPC_URL:-http://bonsol-validator:8899}"
 ws_url="${BONSOL_WS_URL:-ws://bonsol-validator:8900}"
 repo_dir="${BONSOL_REPO_DIR:-/app}"
 zk_program_dir="${repo_dir}/protocol/bonsol-branch-reducer"
+aggregate_program_dir="${repo_dir}/protocol/bonsol-aggregate-reducer"
 harness_manifest="${repo_dir}/protocol/bonsol-callback-harness/Cargo.toml"
 
 mkdir -p "${shared_dir}"
@@ -76,22 +77,83 @@ cd "${repo_dir}"
 export PATH="${PATH}:/root/.cargo/bin:/root/.local/bin:/root/.risc0/bin"
 export DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}"
 
-if [ ! -f "${shared_dir}/reducer-manifest.json" ]; then
+ensure_risc0_toolchain() {
   if ! command -v rzup >/dev/null 2>&1; then
-    curl -L https://risczero.com/install | bash
+    echo "no rzup in this image: the builder image installs pinned RISC Zero components" >&2
+    exit 1
   fi
-
   if ! command -v cargo-risczero >/dev/null 2>&1; then
-    rzup install
+    echo "no cargo-risczero in this image: rebuild docker/bonsol-eval" >&2
+    exit 1
   fi
+  rzup show
+}
 
-  if [ ! -f "${zk_program_dir}/Cargo.lock" ]; then
-    cargo generate-lockfile --manifest-path "${zk_program_dir}/Cargo.toml"
+# `risc0-build` builds a guest inside `risczero/risc0-guest-builder:<tag>`, defaulting
+# to the mutable tag `r0.1.88.0`. A guest ELF is a function of its toolchain, so that
+# tag decides every image id this script produces. Pull the digest the image pins,
+# retag it locally, and point `risc0-build` at the local tag.
+pin_guest_builder() {
+  digest="${RISC0_GUEST_BUILDER_DIGEST:-}"
+  if [ -z "${digest}" ]; then
+    echo "RISC0_GUEST_BUILDER_DIGEST is unset: guest image ids would not be reproducible" >&2
+    exit 1
   fi
+  pinned_tag="r0.1.88.0-pinned"
+  docker pull "risczero/risc0-guest-builder@${digest}"
+  docker tag "risczero/risc0-guest-builder@${digest}" "risczero/risc0-guest-builder:${pinned_tag}"
+  export RISC0_DOCKER_CONTAINER_TAG="${pinned_tag}"
+  echo "guest builder pinned to risczero/risc0-guest-builder@${digest} as :${pinned_tag}"
+}
 
-  bonsol --keypair "${shared_dir}/client-keypair.json" --rpc-url "${rpc_url}" build --zk-program-path "${zk_program_dir}"
-  cp "${zk_program_dir}/manifest.json" "${shared_dir}/reducer-manifest.json"
-fi
+# `bonsol build` runs the RISC Zero docker build with the guest directory as the
+# docker context and `cargo build --locked` inside it, so each guest needs its own
+# Cargo.lock and must be self-contained.
+# A manifest is only a cache hit when the ELF it names is still there. The manifest
+# records an absolute `binaryPath` inside the crate's `target/`, which is regenerated
+# work: a clean checkout, a `cargo clean`, or anything that removes `target/` leaves a
+# manifest pointing at nothing, and `bonsol deploy` then fails with
+# "Failed to load binary from manifest ... No such file or directory" long after the
+# build step said it had nothing to do.
+guest_binary_present() {
+  manifest_path="$1"
+  [ -f "${manifest_path}" ] || return 1
+  binary="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("binaryPath",""))' "${manifest_path}" 2>/dev/null || true)"
+  [ -n "${binary}" ] && [ -f "${binary}" ]
+}
+
+build_guest() {
+  program_dir="$1"
+  manifest_name="$2"
+  if guest_binary_present "${shared_dir}/${manifest_name}"; then
+    return 0
+  fi
+  rm -f "${shared_dir}/${manifest_name}"
+  ensure_risc0_toolchain
+  pin_guest_builder
+  if [ ! -f "${program_dir}/Cargo.lock" ]; then
+    cargo generate-lockfile --manifest-path "${program_dir}/Cargo.toml"
+  fi
+  bonsol --keypair "${shared_dir}/client-keypair.json" --rpc-url "${rpc_url}" build --zk-program-path "${program_dir}"
+  if [ ! -f "${program_dir}/manifest.json" ]; then
+    echo "bonsol build produced no manifest for ${program_dir}" >&2
+    exit 1
+  fi
+  cp "${program_dir}/manifest.json" "${shared_dir}/${manifest_name}"
+  # This container is root and the repository is bind-mounted, so the `target/` tree it
+  # just wrote is unreadable to the user who owns the checkout. A later `docker build`
+  # from that checkout then fails in the context sender -- "error from sender: open
+  # .../target: permission denied" -- before any Dockerfile line runs, and an ignore
+  # rule is not a reliable way out because the sender still stats the directory. Making
+  # the output world-readable is: nothing in it is secret, it is compiler output.
+  chmod -R a+rX "${program_dir}/target" 2>/dev/null || true
+  chmod a+rx "${program_dir}" 2>/dev/null || true
+}
+
+# The aggregate reducer is the guest every aggregate-proof job is bound to; the branch
+# reducer stays for the callback and replay smoke tests.
+build_guest "${aggregate_program_dir}" "aggregate-reducer-manifest.json"
+build_guest "${zk_program_dir}" "reducer-manifest.json"
 
 touch "${shared_dir}/ready"
 

@@ -22,7 +22,9 @@ def _branch_input() -> BranchInput:
 
 
 def _executor(ipfs: FakeIpfs, scripted: list, *, model: str = "stub-model") -> BranchExecutor:
-    return BranchExecutor(ipfs, llm_base_url="http://llm.test/v1", llm_model_name=model, client=StubLlmClient(scripted))
+    # `zkvm_host=""` so these tests never shell out to a prover: the receipts under test
+    # are constructed directly, and a verifier re-execution must not prove one anyway.
+    return BranchExecutor(ipfs, llm_base_url="http://llm.test/v1", llm_model_name=model, client=StubLlmClient(scripted), zkvm_host="")
 
 
 def _lying_output(ipfs: FakeIpfs, executor: BranchExecutor, branch_input: BranchInput) -> BranchOutput:
@@ -234,3 +236,254 @@ def test_closed_window_own_job_and_attested_jobs_are_skipped() -> None:
 
     assert daemon.run_once() == 0
     assert protocol.attestations == []
+
+
+# --- aggregate jobs -------------------------------------------------------------
+#
+# The verifier attests to aggregate-proof jobs too. It does not run the guest: it
+# re-reduces the committed artifact with the Python mirror and attests to the outputs
+# the guest would commit, which is what `settle_aggregate_proof_job` compares against
+# the receipt. A receipt that does not match its own artifact becomes challengeable.
+
+
+def _aggregate_fixture(ipfs: FakeIpfs, *, scalars=(4000, 6000)) -> tuple[dict, Pubkey, bytes, object]:
+    from kswarm_cli.aggregate import aggregate_journal, build_aggregate_artifact
+
+    jobs: dict[Pubkey, FakeJob] = {}
+    branches = []
+    for index, scalar in enumerate(scalars):
+        output = BranchOutput(
+            parent_job="parent-run",
+            branch_index=index,
+            output_kind="scalar",
+            scalar_value_bps=scalar,
+            rng_seed=index,
+            llm_model="stub-model",
+            llm_version_hash="a" * 64,
+            completed_at_unix=1,
+            transcript_cid="bafktranscript",
+        )
+        result_bytes = branch_output_result_bytes(output)
+        key = Pubkey.new_unique()
+        jobs[key] = FakeJob(
+            status=JOB_STATUS_BY_NAME["settled"],
+            result_bytes=result_bytes,
+            submitted_result_hash=hashlib.sha256(result_bytes).digest(),
+        )
+        branches.append(
+            {
+                "branch_index": index,
+                "job": str(key),
+                "output_cid": ipfs.add_json("out", output.model_dump(mode="json", exclude_none=False)),
+                "result_bytes": result_bytes.hex(),
+                "weight": 1,
+            }
+        )
+    aggregate_key = Pubkey.new_unique()
+    artifact = build_aggregate_artifact(
+        parent_run=str(aggregate_key),
+        parent_manifest_cid="bafyparent",
+        output_schema_hash="b" * 64,
+        combiner="weighted-mean",
+        combiner_parameters={},
+        branches=branches,
+    )
+    journal = aggregate_journal(artifact)
+    jobs[aggregate_key] = FakeJob(
+        status=JOB_STATUS_BY_NAME["completed"],
+        job_class=4,  # aggregate-proof
+        worker=Pubkey.new_unique(),
+        input_cid=ipfs.add_bytes("aggregate-input.json", artifact),
+        input_bundle_hash=journal.input_digest,
+        expected_result_hash=journal.journal_hash,
+        result_bytes=journal.committed_outputs,
+        submitted_result_hash=journal.output_digest,
+    )
+    return jobs, aggregate_key, artifact, journal
+
+
+def test_aggregate_receipt_that_matches_its_artifact_is_attested() -> None:
+    ipfs = FakeIpfs()
+    jobs, aggregate_key, _, journal = _aggregate_fixture(ipfs)
+    jobs[aggregate_key].required_software_digest = bytes.fromhex("77" * 32)
+    daemon, protocol = _daemon(ipfs, jobs, executor=None, verifier_reexecute=False)
+
+    assert daemon.run_once() == 1
+    job_key, result_bytes, evidence_cid, software_digest = protocol.attestations[0]
+    # `submit_verifier_attestation` refuses any other digest on a job that names one.
+    assert software_digest == bytes.fromhex("77" * 32)
+    assert job_key == aggregate_key
+    assert result_bytes == journal.committed_outputs
+    # The program settles only when the attestation hash equals the receipt hash.
+    assert jobs[aggregate_key].verifier_attestation_hash == jobs[aggregate_key].submitted_result_hash
+    evidence = ipfs.cat_json(evidence_cid)
+    assert evidence["matched"] is True
+    assert evidence["validation_errors"] == []
+    assert evidence["reduction"]["result_value"] == 5000
+    assert protocol.challenges == []
+
+
+def test_aggregate_receipt_that_is_not_the_reduction_is_attested_against_and_challenged(caplog: pytest.LogCaptureFixture) -> None:
+    ipfs = FakeIpfs()
+    jobs, aggregate_key, _, journal = _aggregate_fixture(ipfs)
+    # A worker that submitted committed outputs claiming a different result value.
+    forged = bytearray(journal.committed_outputs)
+    forged[33:37] = (9999).to_bytes(4, "little")
+    jobs[aggregate_key].result_bytes = bytes(forged)
+    jobs[aggregate_key].submitted_result_hash = hashlib.sha256(bytes(forged)).digest()
+    daemon, protocol = _daemon(ipfs, jobs, executor=None, verifier_reexecute=False)
+
+    with caplog.at_level(logging.WARNING, logger="kswarm.verifier_worker"):
+        assert daemon.run_once() == 1
+    _, result_bytes, evidence_cid, _ = protocol.attestations[0]
+    assert result_bytes == journal.committed_outputs
+    assert jobs[aggregate_key].verifier_attestation_hash != jobs[aggregate_key].submitted_result_hash
+    evidence = ipfs.cat_json(evidence_cid)
+    assert evidence["matched"] is False
+    assert any("submitted_result_hash" in error for error in evidence["validation_errors"])
+    assert protocol.challenges == [aggregate_key]
+
+
+def test_aggregate_artifact_that_is_not_the_one_the_job_committed_is_caught() -> None:
+    ipfs = FakeIpfs()
+    jobs, aggregate_key, _, _ = _aggregate_fixture(ipfs)
+    jobs[aggregate_key].input_bundle_hash = bytes.fromhex("99" * 32)
+    daemon, protocol = _daemon(ipfs, jobs, executor=None, verifier_reexecute=False)
+
+    assert daemon.run_once() == 1
+    _, _, evidence_cid, _ = protocol.attestations[0]
+    errors = ipfs.cat_json(evidence_cid)["validation_errors"]
+    assert any("input_bundle_hash" in error for error in errors)
+
+
+def test_aggregate_branches_are_checked_against_the_chain() -> None:
+    """An artifact can be internally consistent and still name receipts nothing settled."""
+
+    ipfs = FakeIpfs()
+    jobs, aggregate_key, artifact, _ = _aggregate_fixture(ipfs)
+    import json as _json
+
+    branch_key = Pubkey.from_string(_json.loads(artifact)["branches"][0]["job"])
+    jobs[branch_key].submitted_result_hash = bytes.fromhex("55" * 32)
+    daemon, protocol = _daemon(ipfs, jobs, executor=None, verifier_reexecute=False)
+
+    assert daemon.run_once() == 1
+    _, _, evidence_cid, _ = protocol.attestations[0]
+    errors = ipfs.cat_json(evidence_cid)["validation_errors"]
+    assert any("differs from the on-chain submitted_result_hash" in error for error in errors)
+
+
+# --- branch canonicalization receipts -------------------------------------------
+
+
+def _stub_zkvm(monkeypatch: pytest.MonkeyPatch, journal, *, error: str | None = None) -> None:
+    from worker_common import branch_receipt
+
+    def fake_verify(binary, bundle, *, timeout):
+        if error:
+            raise branch_receipt.BranchReceiptError(error)
+        return journal
+
+    monkeypatch.setattr(branch_receipt, "verify", fake_verify)
+
+
+def _receipt_bundle(image_id: str = "ee" * 32) -> dict:
+    return {
+        "bundle_version": "kswarm-branch-receipt-v1",
+        "image_id_hex": image_id,
+        "journal": {"input_digest": "00" * 32, "result_hash": "00" * 32, "output_len": 0},
+        "journal_hex": "00" * 68,
+        "receipt_b64": "AA==",
+    }
+
+
+def _branch_receipt_job(ipfs: FakeIpfs, monkeypatch: pytest.MonkeyPatch, *, receipt_cid: bool = True):
+    """An honest branch whose worker also published a receipt bundle."""
+
+    from worker_common import branch_receipt
+
+    branch_input = _branch_input()
+    executor = _executor(ipfs, [HONEST_ANSWER])
+    execution = executor.execute("job", branch_input)
+    output = execution.output
+    if receipt_cid:
+        cid = ipfs.add_json("receipt", _receipt_bundle())
+        output = output.model_copy(update={"zkvm_receipt_cid": cid})
+    job_key, job = _completed_job(ipfs, branch_input, output)
+    expected = branch_receipt.expected_journal(
+        branch_input.model_dump(mode="json", exclude_none=False),
+        output.model_dump(mode="json", exclude_none=False),
+        job.submitted_result_hash,
+    )
+    return branch_input, output, job_key, job, expected
+
+
+def test_a_verified_branch_receipt_is_recorded_in_the_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    ipfs = FakeIpfs()
+    monkeypatch.setenv("KSWARM_ZKVM_HOST", "/usr/bin/true")
+    branch_input, output, job_key, job, expected = _branch_receipt_job(ipfs, monkeypatch)
+    _stub_zkvm(monkeypatch, expected)
+    daemon, protocol = _daemon(ipfs, {job_key: job}, executor=_executor(ipfs, [HONEST_ANSWER]))
+
+    assert daemon.run_once() == 1
+    _, _, evidence_cid, _ = protocol.attestations[0]
+    report = ipfs.cat_json(evidence_cid)["branch_receipt"]
+    assert report["mode"] == "verify"
+    assert report["errors"] == []
+    assert daemon.metrics.counters["receipts_verified"] == 1
+    assert protocol.challenges == []
+
+
+def test_a_receipt_that_does_not_bind_blocks_the_attestation(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """Re-execution agrees, the receipt does not: attesting would settle an unproven job."""
+
+    from worker_common.branch_receipt import ReceiptJournal
+
+    ipfs = FakeIpfs()
+    monkeypatch.setenv("KSWARM_ZKVM_HOST", "/usr/bin/true")
+    branch_input, output, job_key, job, expected = _branch_receipt_job(ipfs, monkeypatch)
+    _stub_zkvm(monkeypatch, ReceiptJournal(bytes(32), bytes(32), 0))
+    daemon, protocol = _daemon(ipfs, {job_key: job}, executor=_executor(ipfs, [HONEST_ANSWER]))
+
+    with caplog.at_level(logging.ERROR, logger="kswarm.verifier_worker"):
+        assert daemon.run_once() == 0
+    assert protocol.attestations == []
+    assert daemon.metrics.counters["receipt_verification_refusals"] == 1
+    assert "cannot settle" in caplog.text
+
+
+def test_a_receipt_naming_another_guest_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    ipfs = FakeIpfs()
+    monkeypatch.setenv("KSWARM_ZKVM_HOST", "/usr/bin/true")
+    monkeypatch.setenv("KSWARM_ZKVM_IMAGE_ID", "ab" * 32)
+    branch_input, output, job_key, job, expected = _branch_receipt_job(ipfs, monkeypatch)
+    _stub_zkvm(monkeypatch, expected)
+    daemon, protocol = _daemon(ipfs, {job_key: job}, executor=_executor(ipfs, [HONEST_ANSWER]))
+
+    assert daemon.run_once() == 0
+    assert protocol.attestations == []
+    assert daemon.metrics.counters["receipt_binding_failures"] == 1
+
+
+def test_a_missing_receipt_is_only_fatal_when_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    ipfs = FakeIpfs()
+    monkeypatch.setenv("KSWARM_ZKVM_HOST", "/usr/bin/true")
+    branch_input, output, job_key, job, _ = _branch_receipt_job(ipfs, monkeypatch, receipt_cid=False)
+    daemon, protocol = _daemon(ipfs, {job_key: job}, executor=_executor(ipfs, [HONEST_ANSWER]))
+    assert daemon.run_once() == 1
+    assert len(protocol.attestations) == 1
+    assert ipfs.cat_json(protocol.attestations[0][2])["branch_receipt"]["mode"] == "absent"
+
+    monkeypatch.setenv("KSWARM_ZKVM_REQUIRE_RECEIPT", "1")
+    job.verifier_authority = None
+    job.verifier_attestation_hash = None
+    strict, strict_protocol = _daemon(ipfs, {job_key: job}, executor=_executor(ipfs, [HONEST_ANSWER]))
+    assert strict.run_once() == 0
+    assert strict_protocol.attestations == []
+
+
+def test_requiring_receipts_without_a_host_binary_is_a_configuration_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KSWARM_ZKVM_HOST", raising=False)
+    monkeypatch.setenv("KSWARM_ZKVM_REQUIRE_RECEIPT", "1")
+    with pytest.raises(ValueError, match="KSWARM_ZKVM_HOST"):
+        _daemon(FakeIpfs(), {}, executor=None, verifier_reexecute=False)

@@ -1,3 +1,11 @@
+"""The aggregate runner proves what the job already committed, or it submits nothing.
+
+The runner does not decide the aggregate. `kswarm predict bind-aggregate` fixed the
+job's `input_bundle_hash` and `expected_result_hash` against an MFA3 artifact built
+from the settled branch receipts, so every test here starts from a real artifact and
+asks what the runner does when some part of it does not add up.
+"""
+
 from __future__ import annotations
 
 import fcntl
@@ -12,48 +20,25 @@ import pytest
 from solders.pubkey import Pubkey
 
 from aggregator_runner.bonsol_hook import BonsolBinding, BonsolHookError, journal_hash_for, parse_hook_output, run_bonsol_hook
-from aggregator_runner.combiners import CombinerError
 from aggregator_runner.run_store import RunStore
 from aggregator_runner.runner import (
+    ALLOW_UNBOUND_ENV,
     RECEIPT_BINDING_BONSOL,
-    RECEIPT_BINDING_CANONICAL,
-    RESULT_MAGIC,
+    RECEIPT_BINDING_UNPROVEN,
+    AggregateBinding,
     AggregationError,
     AggregatorRunner,
-    aggregate_result_bytes,
     check_binding_against_job,
-    combine,
 )
 from app.protocol.branch_schemas import BranchOutput
-from app.protocol.canonical_hash import canonical_json_bytes
+from app.protocol.canonical_hash import branch_output_result_bytes
 from fakes import FakeIpfs, FakeJob, FakeProtocol, make_config
+from kswarm_cli.aggregate import aggregate_journal, build_aggregate_artifact
+from kswarm_cli.bonsol import framed_input_digest
 from kswarm_cli.constants import JOB_CLASS, JOB_STATUS_BY_NAME, ZERO_HASH
 
 
-COMMITTED = bytes.fromhex("ab" * 32) + (3).to_bytes(4, "little") + (17).to_bytes(4, "little") + b"\x2a"
-INPUT_DIGEST = bytes.fromhex("22" * 32)
 IMAGE_ID = bytes.fromhex("11" * 32)
-BINDING = BonsolBinding(
-    "exec-1",
-    IMAGE_ID,
-    INPUT_DIGEST,
-    hashlib.sha256(COMMITTED).digest(),
-    journal_hash_for(INPUT_DIGEST, COMMITTED),
-    COMMITTED,
-)
-
-
-def _hook_json(**overrides: object) -> str:
-    payload: dict[str, object] = {
-        "execution_id": "exec-1",
-        "image_id": "0x" + IMAGE_ID.hex(),
-        "input_digest": INPUT_DIGEST.hex(),
-        "output_digest": BINDING.output_digest.hex(),
-        "journal_hash": BINDING.journal_hash.hex(),
-        "committed_outputs": COMMITTED.hex(),
-    }
-    payload.update(overrides)
-    return json.dumps({key: value for key, value in payload.items() if value is not None})
 
 
 def _output(index: int, *, scalar: int | None = None, label: int | None = None) -> BranchOutput:
@@ -72,87 +57,369 @@ def _output(index: int, *, scalar: int | None = None, label: int | None = None) 
     )
 
 
-def _run(combiner: str, branch_keys: list[Pubkey], aggregate_key: Pubkey, **manifest_extra) -> dict:
-    manifest = {"question": "q", "combiner": combiner, "output_schema_hash": "b" * 64, "output_schema": {"output_kind": "scalar"}}
-    manifest.update(manifest_extra)
-    return {
-        "schema_version": 1,
-        "parent_run": str(aggregate_key),
-        "aggregate_job": str(aggregate_key),
-        "combiner": combiner,
-        "parent_manifest": manifest,
-        "branch_jobs": [{"branch_index": index, "job": str(key)} for index, key in enumerate(branch_keys)],
-        "aggregate_submitted": False,
+def _binding(execution_id: str, journal) -> BonsolBinding:
+    return BonsolBinding(
+        execution_id,
+        IMAGE_ID,
+        journal.input_digest,
+        journal.output_digest,
+        journal.journal_hash,
+        journal.committed_outputs,
+    )
+
+
+def _hook_json(journal, **overrides: object) -> str:
+    payload: dict[str, object] = {
+        "execution_id": "exec-1",
+        "image_id": "0x" + IMAGE_ID.hex(),
+        "input_digest": journal.input_digest.hex(),
+        "output_digest": journal.output_digest.hex(),
+        "journal_hash": journal.journal_hash.hex(),
+        "committed_outputs": journal.committed_outputs.hex(),
     }
+    payload.update(overrides)
+    return json.dumps({key: value for key, value in payload.items() if value is not None})
 
 
-def test_combine_dispatches_on_the_manifest_combiner() -> None:
-    aggregate = Pubkey.new_unique()
-    outputs = [_output(0, scalar=1), _output(1, scalar=2), _output(2, scalar=2)]
-    weighted = combine(_run("weighted-mean", [], aggregate), outputs)
-    assert (weighted.combiner_id, weighted.scalar_value_bps, weighted.combiner_parameters) == (1, 2, {"weights": "uniform"})
+class _Fixture:
+    """A bound aggregate job, its artifact, and the branch jobs the artifact names."""
 
-    trimmed_outputs = [_output(index, scalar=value) for index, value in enumerate([7000, 1000, 9000, 5000, 5100])]
-    trimmed = combine(_run("trimmed-mean", [], aggregate, combiner_parameters={"trim_bps": 4000}), trimmed_outputs)
-    assert (trimmed.combiner_id, trimmed.scalar_value_bps, trimmed.rejected_count) == (2, 5700, 2)
-    assert trimmed.combiner_parameters == {"trim_bps": 4000, "outlier_count": 2}
+    def __init__(self, tmp_path: Path, *, combiner: str = "weighted-mean", scalars=(4000, 6000), **runner_kwargs):
+        self.ipfs = FakeIpfs()
+        self.branch_keys = [Pubkey.new_unique() for _ in scalars]
+        self.aggregate_key = Pubkey.new_unique()
+        self.jobs: dict[Pubkey, FakeJob] = {}
+        branches = []
+        for index, (key, scalar) in enumerate(zip(self.branch_keys, scalars)):
+            output = _output(index, scalar=scalar)
+            result_bytes = branch_output_result_bytes(output)
+            output_cid = self.ipfs.add_json("out", output.model_dump(mode="json", exclude_none=False))
+            self.jobs[key] = FakeJob(
+                status=JOB_STATUS_BY_NAME["settled"],
+                output_cid=output_cid,
+                result_bytes=result_bytes,
+                submitted_result_hash=hashlib.sha256(result_bytes).digest(),
+            )
+            branches.append(
+                {
+                    "branch_index": index,
+                    "job": str(key),
+                    "output_cid": output_cid,
+                    "result_bytes": result_bytes.hex(),
+                    "weight": 1,
+                }
+            )
+        self.artifact = build_aggregate_artifact(
+            parent_run=str(self.aggregate_key),
+            parent_manifest_cid="bafyparent",
+            output_schema_hash="b" * 64,
+            combiner=combiner,
+            combiner_parameters={"trim_bps": 5000} if combiner == "trimmed-mean" else {},
+            branches=branches,
+        )
+        self.journal = aggregate_journal(self.artifact)
+        self.input_cid = self.ipfs.add_bytes("aggregate-input.json", self.artifact)
+        self.jobs[self.aggregate_key] = FakeJob(
+            status=JOB_STATUS_BY_NAME["open"],
+            job_class=JOB_CLASS["aggregate-proof"],
+            execute_deadline=5000,
+            input_cid=self.input_cid,
+            input_bundle_hash=self.journal.input_digest,
+            required_software_digest=IMAGE_ID,
+            expected_result_hash=self.journal.journal_hash,
+        )
+        self.protocol = FakeProtocol(self.jobs)
+        runs_dir = tmp_path / "predict_runs"
+        runs_dir.mkdir(exist_ok=True)
+        self.run_path = runs_dir / f"{self.aggregate_key}.json"
+        self.run_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "parent_run": str(self.aggregate_key),
+                    "aggregate_job": str(self.aggregate_key),
+                    "combiner": combiner,
+                    "combiner_parameters": {},
+                    "parent_manifest": {"output_schema_hash": "b" * 64},
+                    "branch_jobs": [{"branch_index": i, "job": str(k)} for i, k in enumerate(self.branch_keys)],
+                    "aggregate_submitted": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        defaults = {
+            "hook_command": "hook --production",
+            "hook_runner": lambda *args, **kwargs: _binding("exec-1", self.journal),
+            "environ": {},
+        }
+        defaults.update(runner_kwargs)
+        self.runner = AggregatorRunner(
+            make_config(keypair_name="aggregator"),
+            protocol=self.protocol,
+            ipfs=self.ipfs,
+            store=RunStore(runs_dir),
+            clock=lambda: 2_000.0,
+            **defaults,
+        )
 
-    votes = [_output(0, label=1), _output(1, label=0), _output(2, label=1)]
-    majority = combine(_run("majority-vote", [], aggregate, output_schema={"category_dictionary": ["no", "yes"]}), votes)
-    assert (majority.combiner_id, majority.categorical_label_index, majority.scalar_value_bps) == (3, 1, None)
-    assert majority.branch_count == 3
-    assert majority.output_schema_hash == "b" * 64
+    def saved(self) -> dict:
+        return json.loads(self.run_path.read_text(encoding="utf-8"))
 
 
-def test_combine_fails_closed() -> None:
-    aggregate = Pubkey.new_unique()
-    scalars = [_output(0, scalar=1000), _output(1, scalar=3000)]
-    with pytest.raises(CombinerError, match="UnknownCombiner"):
-        combine(_run("median", [], aggregate), scalars)
-    with pytest.raises(AggregationError, match="trim_bps"):
-        combine(_run("trimmed-mean", [], aggregate), scalars)
-    with pytest.raises(AggregationError, match="weights"):
-        combine(_run("weighted-mean", [], aggregate, combiner_parameters={"weights": [1, 2]}), scalars)
-    with pytest.raises(AggregationError, match="category_dictionary"):
-        combine(_run("majority-vote", [], aggregate), [_output(0, label=0)])
-    with pytest.raises(AggregationError, match="outside the committed category dictionary"):
-        combine(_run("majority-vote", [], aggregate, output_schema={"category_dictionary": ["a", "b"]}), [_output(0, label=2)])
-    with pytest.raises(AggregationError, match="no scalar value"):
-        combine(_run("weighted-mean", [], aggregate), [_output(0, label=0)])
-    with pytest.raises(AggregationError, match="no categorical label"):
-        combine(_run("majority-vote", [], aggregate, output_schema={"category_dictionary": ["a", "b"]}), scalars)
+def test_runner_proves_the_committed_artifact_and_persists_atomically(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    seen: list[dict] = []
+
+    fixture = _Fixture(tmp_path, hook_runner=lambda command, payload, **kwargs: (seen.append((command, payload)), None)[1])
+    # Re-bind the hook now that the fixture has a journal to answer with.
+    fixture.runner.hook_runner = lambda command, payload, **kwargs: (
+        seen.append((command, payload)),
+        _binding("exec-1", fixture.journal),
+    )[1]
+
+    with caplog.at_level(logging.INFO, logger="kswarm.aggregator_runner"):
+        assert fixture.runner.run_once() == 1
+
+    assert fixture.protocol.claims == [fixture.aggregate_key]
+    job_key, output_cid, result_bytes = fixture.protocol.receipts[0]
+    assert job_key == fixture.aggregate_key
+    assert result_bytes == fixture.journal.committed_outputs
+    assert len(result_bytes) == 73
+    assert fixture.jobs[fixture.aggregate_key].submitted_result_hash == fixture.journal.output_digest
+
+    saved = fixture.saved()
+    assert saved["aggregate_submitted"] is True
+    assert saved["aggregate_output_cid"] == output_cid
+    assert saved["aggregate_result_hash"] == fixture.journal.output_digest.hex()
+    assert saved["aggregate_claimed_at_unix"] == 2000
+    assert saved["aggregate_journal"]["journal_hash"] == fixture.journal.journal_hash.hex()
+    assert saved["aggregate_bonsol_execution"]["execution_id"] == "exec-1"
+    assert sorted(p.name for p in fixture.run_path.parent.iterdir()) == [
+        f"{fixture.aggregate_key}.json",
+        f"{fixture.aggregate_key}.lock",
+    ]
+
+    artifact = fixture.ipfs.cat_json(output_cid)
+    assert artifact["result"]["scalar_value_bps"] == 5000
+    assert artifact["result"]["combiner_id"] == 1
+    assert artifact["result"]["branch_count"] == 2
+    assert artifact["receipt_binding"] == RECEIPT_BINDING_BONSOL
+    assert artifact["bonsol"]["journal_hash"] == fixture.journal.journal_hash.hex()
+    assert len(artifact["branch_outputs"]) == 2
+
+    command, payload = seen[0]
+    assert command == "hook --production"
+    assert payload["aggregate_job"] == str(fixture.aggregate_key)
+    assert payload["input_artifact_hex"] == fixture.artifact.hex()
+    assert payload["committed_outputs"] == fixture.journal.committed_outputs.hex()
+    assert fixture.runner.metrics.counters["bonsol_hook_proved"] == 1
+    # The receipt lands before the proof: the callback needs a Completed job.
+    assert f"result_hash={fixture.journal.output_digest.hex()}" in caplog.text
+    assert fixture.runner.run_once() == 0
+    assert len(fixture.protocol.receipts) == 1
 
 
-def test_aggregate_result_bytes_are_canonical_mfa2() -> None:
-    aggregate = Pubkey.new_unique()
-    result = combine(_run("weighted-mean", [], aggregate), [_output(0, scalar=4000), _output(1, scalar=6000)])
-    unbound = aggregate_result_bytes(result)
-    decoded = json.loads(unbound.decode("utf-8"))
-    assert decoded["schema"] == "MFA2"
-    assert decoded["scalar_value_bps"] == 5000
-    assert decoded["bonsol"] is None
-    bound = aggregate_result_bytes(result.with_bonsol(BINDING))
-    payload = canonical_json_bytes({"schema": "MFA2", **result.with_bonsol(BINDING).to_json()})
-    assert len(payload) > 512
-    assert bound == RESULT_MAGIC + hashlib.sha256(payload).digest()
+def test_runner_waits_until_the_aggregate_job_is_opened(tmp_path: Path) -> None:
+    fixture = _Fixture(tmp_path)
+    del fixture.jobs[fixture.aggregate_key]
+    assert fixture.runner.run_once() == 0
+    assert fixture.protocol.claims == []
 
 
-def test_hook_output_is_validated_field_by_field() -> None:
-    assert parse_hook_output(_hook_json()) == BINDING
-    wrong_output_digest = _hook_json(output_digest="00" * 32)
-    wrong_journal = _hook_json(journal_hash="00" * 32)
+def test_artifact_that_is_not_the_one_the_job_was_opened_against_is_refused(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    fixture = _Fixture(tmp_path)
+    fixture.jobs[fixture.aggregate_key].input_bundle_hash = bytes.fromhex("99" * 32)
+    with caplog.at_level(logging.ERROR, logger="kswarm.aggregator_runner"):
+        assert fixture.runner.run_once() == 0
+    assert fixture.protocol.claims == []
+    assert fixture.protocol.receipts == []
+    assert "input_bundle_hash" in caplog.text
+
+
+def test_an_artifact_that_departs_from_its_named_plan_is_refused(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A second party confirms the run did not change its combiner after seeing the answers.
+
+    The aggregate job's hashes are fixed at bind time, which is after every branch
+    result is visible. The plan is pinned before any branch runs and its CID rides
+    inside the artifact, so the aggregator can check the reduction it is being paid to
+    prove is the one the run committed to.
+    """
+
+    fixture = _Fixture(tmp_path)
+    plan = {
+        "combiner": "trimmed-mean",
+        "combiner_parameters": {"trim_bps": 2500},
+        "branch_jobs": [{"job": str(key)} for key in fixture.branch_keys],
+    }
+    plan_cid = fixture.ipfs.add_json("aggregate-plan.json", plan)
+    document = json.loads(fixture.artifact.decode("utf-8"))
+    document["aggregate_plan_cid"] = plan_cid
+    artifact = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    fixture.ipfs.objects[fixture.input_cid] = artifact
+    fixture.jobs[fixture.aggregate_key].input_bundle_hash = framed_input_digest(artifact)
+    fixture.jobs[fixture.aggregate_key].expected_result_hash = aggregate_journal(artifact).journal_hash
+
+    with caplog.at_level(logging.ERROR, logger="kswarm.aggregator_runner"):
+        assert fixture.runner.run_once() == 0
+    assert fixture.protocol.receipts == []
+    assert "departs from the aggregate plan" in caplog.text
+
+
+def test_reduction_that_does_not_match_the_expected_journal_is_refused(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    fixture = _Fixture(tmp_path)
+    fixture.jobs[fixture.aggregate_key].expected_result_hash = bytes.fromhex("77" * 32)
+    with caplog.at_level(logging.ERROR, logger="kswarm.aggregator_runner"):
+        assert fixture.runner.run_once() == 0
+    assert fixture.protocol.receipts == []
+    assert "expected_result_hash" in caplog.text
+
+
+def test_a_zero_software_digest_is_refused(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    fixture = _Fixture(tmp_path)
+    fixture.jobs[fixture.aggregate_key].required_software_digest = ZERO_HASH
+    with caplog.at_level(logging.ERROR, logger="kswarm.aggregator_runner"):
+        assert fixture.runner.run_once() == 0
+    assert fixture.protocol.receipts == []
+    assert "no Bonsol marker can ever match" in caplog.text
+
+
+def test_a_receipt_no_branch_job_settled_is_refused(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The artifact must describe real branch jobs, not just be internally consistent."""
+
+    fixture = _Fixture(tmp_path)
+    fixture.jobs[fixture.branch_keys[0]].submitted_result_hash = bytes.fromhex("55" * 32)
+    with caplog.at_level(logging.ERROR, logger="kswarm.aggregator_runner"):
+        assert fixture.runner.run_once() == 0
+    assert fixture.protocol.receipts == []
+    assert "differs from the on-chain submitted_result_hash" in caplog.text
+
+
+def test_a_branch_job_that_does_not_exist_is_refused(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    fixture = _Fixture(tmp_path)
+    del fixture.jobs[fixture.branch_keys[1]]
+    with caplog.at_level(logging.ERROR, logger="kswarm.aggregator_runner"):
+        assert fixture.runner.run_once() == 0
+    assert fixture.protocol.receipts == []
+    assert "does not exist" in caplog.text
+
+
+def test_hook_failure_leaves_the_receipt_on_chain_and_no_marker(tmp_path: Path) -> None:
+    """The receipt has to land first, so a failed proof is a Completed job with no marker."""
+
+    def failing_hook(*args, **kwargs):
+        raise BonsolHookError("bonsol execute timed out")
+
+    fixture = _Fixture(tmp_path, hook_runner=failing_hook)
+    assert fixture.runner.run_once() == 0
+    assert fixture.protocol.claims == [fixture.aggregate_key]
+    assert len(fixture.protocol.receipts) == 1
+    assert fixture.runner.metrics.counters["bonsol_hook_failed"] == 1
+    assert fixture.runner.metrics.counters["aggregate_failed"] == 1
+    assert fixture.saved()["aggregate_submitted"] is True
+
+
+def test_an_execution_that_proved_a_different_claim_is_refused(tmp_path: Path) -> None:
+    fixture = _Fixture(tmp_path)
+    other = bytes([1]) + bytes(72)
+    fixture.runner.hook_runner = lambda *args, **kwargs: BonsolBinding(
+        "exec-1",
+        IMAGE_ID,
+        fixture.journal.input_digest,
+        hashlib.sha256(other).digest(),
+        journal_hash_for(fixture.journal.input_digest, other),
+        other,
+    )
+    assert fixture.runner.run_once() == 0
+    assert fixture.runner.metrics.counters["bonsol_hook_failed"] == 1
+
+
+def test_a_missing_hook_refuses_to_leave_an_unprovable_receipt(tmp_path: Path) -> None:
+    fixture = _Fixture(tmp_path, hook_command="", environ={})
+    assert fixture.runner.allow_unproven is False
+    assert fixture.runner.run_once() == 0
+    assert fixture.protocol.receipts == []
+
+
+def test_the_unproven_escape_hatch_is_explicit_and_loud(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="kswarm.aggregator_runner"):
+        fixture = _Fixture(tmp_path, hook_command="", environ={ALLOW_UNBOUND_ENV: "1"})
+        assert fixture.runner.allow_unproven is True
+        assert fixture.runner.run_once() == 1
+    assert "local-development setting" in caplog.text
+    assert "cannot settle" in caplog.text
+    _, output_cid, result_bytes = fixture.protocol.receipts[0]
+    assert result_bytes == fixture.journal.committed_outputs
+    assert fixture.ipfs.cat_json(output_cid)["receipt_binding"] == RECEIPT_BINDING_UNPROVEN
+    assert fixture.runner.metrics.counters["aggregate_unproven"] == 1
+
+
+@pytest.mark.parametrize("cluster", ["devnet", "mainnet"])
+def test_the_unproven_escape_hatch_is_refused_on_a_real_cluster(tmp_path: Path, cluster: str) -> None:
+    ipfs = FakeIpfs()
+    with pytest.raises(AggregationError, match="is refused on cluster"):
+        AggregatorRunner(
+            make_config(keypair_name="aggregator", cluster=cluster),
+            protocol=FakeProtocol({}),
+            ipfs=ipfs,
+            store=RunStore(tmp_path),
+            hook_command="",
+            environ={ALLOW_UNBOUND_ENV: "1"},
+        )
+
+
+def test_trimmed_mean_artifact_reduces_with_its_committed_parameters(tmp_path: Path) -> None:
+    fixture = _Fixture(tmp_path, combiner="trimmed-mean", scalars=(4000, 6000))
+    assert fixture.runner.run_once() == 1
+    result = fixture.ipfs.cat_json(fixture.protocol.receipts[0][1])["result"]
+    # Two branches, trim 50% -> one outlier: the lower median is 6000, so 4000 is dropped.
+    assert result["scalar_value_bps"] == 6000
+    assert result["combiner_parameters"]["trim_bps"] == 5000
+
+
+def test_runner_resumes_its_own_claim_without_claiming_again(tmp_path: Path) -> None:
+    fixture = _Fixture(tmp_path)
+    job = fixture.jobs[fixture.aggregate_key]
+    job.status = JOB_STATUS_BY_NAME["claimed"]
+    job.worker = fixture.protocol.wallet.pubkey
+    assert fixture.runner.run_once() == 1
+    assert fixture.protocol.claims == []
+    assert fixture.protocol.receipts[0][0] == fixture.aggregate_key
+    assert fixture.saved()["aggregate_submitted"] is True
+
+
+def test_runner_skips_a_run_locked_by_another_runner(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    fixture = _Fixture(tmp_path)
+    lock_path = fixture.run_path.with_name(f"{fixture.run_path.stem}.lock")
+    holder = open(lock_path, "a+")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with caplog.at_level(logging.INFO, logger="kswarm.aggregator_runner"):
+            assert fixture.runner.run_once() == 0
+    finally:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        holder.close()
+    assert fixture.protocol.claims == []
+    assert "locked by another runner" in caplog.text
+    assert fixture.runner.run_once() == 1
+
+
+def test_hook_output_is_validated_field_by_field(tmp_path: Path) -> None:
+    fixture = _Fixture(tmp_path)
+    journal = fixture.journal
+    assert parse_hook_output(_hook_json(journal)) == _binding("exec-1", journal)
+    wrong_output_digest = _hook_json(journal, output_digest="00" * 32)
+    wrong_journal = _hook_json(journal, journal_hash="00" * 32)
     for broken in (
         "not json",
         "[]",
-        _hook_json(execution_id=None),
-        _hook_json(execution_id=""),
-        _hook_json(execution_id="x" * 33),
-        _hook_json(image_id="11" * 31),
-        _hook_json(image_id="zz" * 32),
-        _hook_json(journal_hash=None),
-        _hook_json(committed_outputs=None),
-        _hook_json(committed_outputs=""),
-        _hook_json(committed_outputs="ab" * 513),
+        _hook_json(journal, execution_id=None),
+        _hook_json(journal, execution_id=""),
+        _hook_json(journal, execution_id="x" * 33),
+        _hook_json(journal, image_id="11" * 31),
+        _hook_json(journal, image_id="zz" * 32),
+        _hook_json(journal, journal_hash=None),
+        _hook_json(journal, committed_outputs=None),
+        _hook_json(journal, committed_outputs=""),
+        _hook_json(journal, committed_outputs="ab" * 513),
         wrong_output_digest,
         wrong_journal,
     ):
@@ -164,16 +431,19 @@ def test_hook_output_is_validated_field_by_field() -> None:
         parse_hook_output(wrong_journal)
 
 
-def test_binding_is_checked_against_the_aggregate_job() -> None:
-    job = FakeJob(job_class=JOB_CLASS["aggregate-proof"], input_bundle_hash=INPUT_DIGEST, required_software_digest=IMAGE_ID, expected_result_hash=BINDING.journal_hash)
-    check_binding_against_job(BINDING, job)
-    check_binding_against_job(BINDING, FakeJob(input_bundle_hash=INPUT_DIGEST, required_software_digest=ZERO_HASH, expected_result_hash=ZERO_HASH))
+def test_binding_is_checked_against_the_aggregate_job(tmp_path: Path) -> None:
+    fixture = _Fixture(tmp_path)
+    binding = AggregateBinding(artifact=fixture.artifact, journal=fixture.journal)
+    execution = _binding("exec-1", fixture.journal)
+    job = fixture.jobs[fixture.aggregate_key]
+    check_binding_against_job(execution, job, binding)
+
     with pytest.raises(BonsolHookError, match="input_bundle_hash"):
-        check_binding_against_job(BINDING, FakeJob(input_bundle_hash=bytes(32), required_software_digest=IMAGE_ID, expected_result_hash=BINDING.journal_hash))
+        check_binding_against_job(execution, FakeJob(input_bundle_hash=bytes(32), required_software_digest=IMAGE_ID, expected_result_hash=fixture.journal.journal_hash), binding)
     with pytest.raises(BonsolHookError, match="required_software_digest"):
-        check_binding_against_job(BINDING, FakeJob(input_bundle_hash=INPUT_DIGEST, required_software_digest=bytes.fromhex("ff" * 32), expected_result_hash=BINDING.journal_hash))
+        check_binding_against_job(execution, FakeJob(input_bundle_hash=fixture.journal.input_digest, required_software_digest=bytes.fromhex("ff" * 32), expected_result_hash=fixture.journal.journal_hash), binding)
     with pytest.raises(BonsolHookError, match="expected_result_hash"):
-        check_binding_against_job(BINDING, FakeJob(input_bundle_hash=INPUT_DIGEST, required_software_digest=IMAGE_ID, expected_result_hash=bytes.fromhex("ff" * 32)))
+        check_binding_against_job(execution, FakeJob(input_bundle_hash=fixture.journal.input_digest, required_software_digest=IMAGE_ID, expected_result_hash=bytes.fromhex("ff" * 32)), binding)
 
 
 def _script(tmp_path: Path, name: str, body: str) -> str:
@@ -184,9 +454,11 @@ def _script(tmp_path: Path, name: str, body: str) -> str:
 
 
 def test_run_bonsol_hook_runs_the_command_with_the_payload(tmp_path: Path) -> None:
-    (tmp_path / "hook.json").write_text(_hook_json(), encoding="utf-8")
+    fixture = _Fixture(tmp_path)
+    expected = _binding("exec-1", fixture.journal)
+    (tmp_path / "hook.json").write_text(_hook_json(fixture.journal), encoding="utf-8")
     good = _script(tmp_path, "good.sh", 'cat "$(dirname "$0")/hook.json"\n')
-    assert run_bonsol_hook(good, {"run": "r"}, cwd=tmp_path, timeout_seconds=10) == BINDING
+    assert run_bonsol_hook(good, {"run": "r"}, cwd=tmp_path, timeout_seconds=10) == expected
     echo = _script(tmp_path, "echo.sh", 'for arg in "$@"; do last="$arg"; done\nprintf \'%s\' "$last" > "$(dirname "$0")/payload.json"\ncat "$(dirname "$0")/hook.json"\n')
     run_bonsol_hook(echo + " --flag", {"run": "r", "result": {"x": 1}}, cwd=tmp_path, timeout_seconds=10)
     assert json.loads((tmp_path / "payload.json").read_text()) == {"run": "r", "result": {"x": 1}}
@@ -197,169 +469,6 @@ def test_run_bonsol_hook_runs_the_command_with_the_payload(tmp_path: Path) -> No
         run_bonsol_hook(str(tmp_path / "missing.sh"), {"run": "r"}, cwd=tmp_path, timeout_seconds=10)
     with pytest.raises(BonsolHookError, match="empty"):
         run_bonsol_hook("   ", {"run": "r"}, cwd=tmp_path, timeout_seconds=10)
-
-
-def _runner(
-    tmp_path: Path,
-    *,
-    combiner: str = "weighted-mean",
-    hook_command: str = "",
-    hook_runner=None,
-    aggregate_status: int = JOB_STATUS_BY_NAME["open"],
-    branch_status: int = JOB_STATUS_BY_NAME["settled"],
-    aggregate_input_bundle_hash: bytes = INPUT_DIGEST,
-    **manifest_extra,
-):
-    ipfs = FakeIpfs()
-    branch_keys = [Pubkey.new_unique(), Pubkey.new_unique()]
-    aggregate_key = Pubkey.new_unique()
-    jobs = {}
-    for index, key in enumerate(branch_keys):
-        output = _output(index, scalar=4000 + 2000 * index)
-        jobs[key] = FakeJob(status=branch_status, output_cid=ipfs.add_json("out", output.model_dump(mode="json", exclude_none=False)))
-    jobs[aggregate_key] = FakeJob(
-        status=aggregate_status,
-        job_class=JOB_CLASS["aggregate-proof"],
-        execute_deadline=5000,
-        input_bundle_hash=aggregate_input_bundle_hash,
-        required_software_digest=IMAGE_ID,
-        expected_result_hash=BINDING.journal_hash,
-    )
-    protocol = FakeProtocol(jobs)
-    runs_dir = tmp_path / "predict_runs"
-    runs_dir.mkdir()
-    run_path = runs_dir / f"{aggregate_key}.json"
-    run_path.write_text(json.dumps(_run(combiner, branch_keys, aggregate_key, **manifest_extra)), encoding="utf-8")
-    runner = AggregatorRunner(
-        make_config(keypair_name="aggregator"),
-        protocol=protocol,
-        ipfs=ipfs,
-        store=RunStore(runs_dir),
-        hook_command=hook_command,
-        hook_runner=hook_runner or (lambda *args, **kwargs: BINDING),
-        clock=lambda: 2_000.0,
-    )
-    return runner, protocol, ipfs, run_path, aggregate_key
-
-
-def test_runner_binds_the_bonsol_outputs_and_persists_atomically(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    seen_payloads: list[dict] = []
-
-    def hook(command: str, payload: dict, *, cwd: Path, timeout_seconds: float) -> BonsolBinding:
-        seen_payloads.append(payload)
-        assert command == "hook --production"
-        return BINDING
-
-    runner, protocol, ipfs, run_path, aggregate_key = _runner(tmp_path, hook_command="hook --production", hook_runner=hook)
-    with caplog.at_level(logging.INFO, logger="kswarm.aggregator_runner"):
-        assert runner.run_once() == 1
-
-    assert protocol.claims == [aggregate_key]
-    job_key, output_cid, result_bytes = protocol.receipts[0]
-    assert job_key == aggregate_key
-    assert result_bytes == COMMITTED
-    assert protocol.jobs_by_key[aggregate_key].submitted_result_hash == BINDING.output_digest
-    saved = json.loads(run_path.read_text(encoding="utf-8"))
-    assert saved["aggregate_submitted"] is True
-    assert saved["aggregate_output_cid"] == output_cid
-    assert saved["aggregate_result_hash"] == BINDING.output_digest.hex()
-    assert saved["aggregate_claimed_at_unix"] == 2000
-    assert sorted(p.name for p in run_path.parent.iterdir()) == [f"{aggregate_key}.json", f"{aggregate_key}.lock"]
-    artifact = ipfs.cat_json(output_cid)
-    assert artifact["result"]["scalar_value_bps"] == 5000
-    assert artifact["result"]["combiner_id"] == 1
-    assert artifact["result"]["bonsol"] == BINDING.to_json()
-    assert artifact["receipt_binding"] == RECEIPT_BINDING_BONSOL
-    assert artifact["result_hash"] == BINDING.output_digest.hex()
-    assert seen_payloads[0]["aggregate_job"] == str(aggregate_key)
-    assert seen_payloads[0]["result"]["scalar_value_bps"] == 5000
-    assert len(seen_payloads[0]["aggregate_result_sha256"]) == 64
-    assert runner.metrics.counters["bonsol_hook_bound"] == 1
-    assert f"result_hash={BINDING.output_digest.hex()}" in caplog.text
-    assert runner.run_once() == 0
-    assert len(protocol.receipts) == 1
-
-
-def test_hook_failure_fails_the_aggregation_before_any_claim(tmp_path: Path) -> None:
-    def failing_hook(*args, **kwargs):
-        raise BonsolHookError("harness exited 1")
-
-    runner, protocol, _, run_path, _ = _runner(tmp_path, hook_command="hook", hook_runner=failing_hook)
-    before = run_path.read_text(encoding="utf-8")
-
-    assert runner.run_once() == 0
-    assert protocol.claims == []
-    assert protocol.receipts == []
-    assert run_path.read_text(encoding="utf-8") == before
-    assert runner.metrics.counters["bonsol_hook_failed"] == 1
-    assert runner.metrics.counters["aggregate_failed"] == 1
-
-
-def test_binding_that_cannot_settle_is_rejected_before_any_claim(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    runner, protocol, _, _, _ = _runner(tmp_path, hook_command="hook", aggregate_input_bundle_hash=bytes.fromhex("99" * 32))
-    with caplog.at_level(logging.ERROR, logger="kswarm.aggregator_runner"):
-        assert runner.run_once() == 0
-    assert protocol.claims == []
-    assert runner.metrics.counters["bonsol_hook_failed"] == 1
-    assert "input_bundle_hash" in caplog.text
-
-
-def test_missing_hook_is_a_loud_unbound_receipt(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    runner, protocol, ipfs, _, _ = _runner(tmp_path, hook_command="")
-    with caplog.at_level(logging.WARNING, logger="kswarm.aggregator_runner"):
-        assert runner.run_once() == 1
-    assert "carries no Bonsol binding" in caplog.text
-    _, output_cid, result_bytes = protocol.receipts[0]
-    artifact = ipfs.cat_json(output_cid)
-    assert artifact["result"]["bonsol"] is None
-    assert artifact["receipt_binding"] == RECEIPT_BINDING_CANONICAL
-    assert json.loads(result_bytes.decode("utf-8"))["schema"] == "MFA2"
-
-
-def test_unknown_combiner_submits_nothing(tmp_path: Path) -> None:
-    runner, protocol, _, _, _ = _runner(tmp_path, combiner="median")
-    assert runner.run_once() == 0
-    assert protocol.claims == []
-    assert runner.metrics.counters["aggregate_failed"] == 1
-
-
-def test_trimmed_mean_uses_the_manifest_trim_parameter(tmp_path: Path) -> None:
-    runner, protocol, ipfs, _, _ = _runner(tmp_path, combiner="trimmed-mean", combiner_parameters={"trim_bps": 5000})
-    assert runner.run_once() == 1
-    result = ipfs.cat_json(protocol.receipts[0][1])["result"]
-    # Two branches (4000, 6000), trim 50% -> one outlier: the lower median is 6000, so 4000 is dropped.
-    assert (result["scalar_value_bps"], result["rejected_count"], result["combiner_parameters"]) == (6000, 1, {"trim_bps": 5000, "outlier_count": 1})
-
-
-def test_runner_waits_for_unready_branches(tmp_path: Path) -> None:
-    runner, protocol, _, _, _ = _runner(tmp_path, branch_status=JOB_STATUS_BY_NAME["completed"])
-    assert runner.run_once() == 0
-    assert protocol.claims == []
-
-
-def test_runner_resumes_its_own_claim_without_claiming_again(tmp_path: Path) -> None:
-    runner, protocol, _, run_path, aggregate_key = _runner(tmp_path, aggregate_status=JOB_STATUS_BY_NAME["claimed"])
-    protocol.jobs_by_key[aggregate_key].worker = protocol.wallet.pubkey
-    assert runner.run_once() == 1
-    assert protocol.claims == []
-    assert protocol.receipts[0][0] == aggregate_key
-    assert json.loads(run_path.read_text())["aggregate_submitted"] is True
-
-
-def test_runner_skips_a_run_locked_by_another_runner(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    runner, protocol, _, run_path, _ = _runner(tmp_path)
-    lock_path = run_path.with_name(f"{run_path.stem}.lock")
-    holder = open(lock_path, "a+")
-    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    try:
-        with caplog.at_level(logging.INFO, logger="kswarm.aggregator_runner"):
-            assert runner.run_once() == 0
-    finally:
-        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
-        holder.close()
-    assert protocol.claims == []
-    assert "locked by another runner" in caplog.text
-    assert runner.run_once() == 1
 
 
 def test_run_store_save_is_atomic_and_leaves_no_temp_files(tmp_path: Path) -> None:
@@ -379,3 +488,23 @@ def test_run_store_save_is_atomic_and_leaves_no_temp_files(tmp_path: Path) -> No
     finally:
         os.chmod(tmp_path, 0o700)
     assert json.loads(path.read_text()) == {"a": 2}
+
+
+def test_a_branch_that_did_not_settle_is_refused(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A slashed or cancelled branch still has receipt bytes on chain."""
+
+    fixture = _Fixture(tmp_path)
+    fixture.jobs[fixture.branch_keys[0]].status = JOB_STATUS_BY_NAME["slashed"]
+    with caplog.at_level(logging.ERROR, logger="kswarm.aggregator_runner"):
+        assert fixture.runner.run_once() == 0
+    assert fixture.protocol.receipts == []
+    assert "needs every branch settled" in caplog.text
+
+
+def test_allow_completed_branches_accepts_an_attested_branch(tmp_path: Path) -> None:
+    fixture = _Fixture(tmp_path, allow_completed_branches=True)
+    branch = fixture.jobs[fixture.branch_keys[0]]
+    branch.status = JOB_STATUS_BY_NAME["submitted"]
+    branch.verifier_attestation_hash = branch.submitted_result_hash
+    assert fixture.runner.run_once() == 1
+    assert len(fixture.protocol.receipts) == 1

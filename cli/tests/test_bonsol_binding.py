@@ -1,10 +1,15 @@
-"""The CLI's aggregate binding must equal what the Bonsol callback harness computes.
+"""The CLI's legacy branch-reducer mirror must equal what the callback harness computes.
 
 `tests/vectors/bonsol_harness_vectors.json` was produced by running
 `protocol/bonsol-callback-harness prepare` (offline) for several inputs; see
 `vectors/README.md` for the exact commands. The on-chain program derives the
 journal hash as `sha256(input_digest || committed_outputs)`; the harness uses
 the same rule for `prepare-production`.
+
+These vectors cover `protocol/bonsol-branch-reducer`, the guest that commits the
+statistics its caller supplied. It is not on the aggregate path any more -- see
+`cli/tests/test_aggregate_artifact.py` for that -- but it still drives the Bonsol
+callback, marker-PDA and replay smoke tests, so the mirror is still pinned.
 """
 
 from __future__ import annotations
@@ -22,11 +27,8 @@ from kswarm_cli.bonsol import (
     FRAMING_RULE,
     IMAGE_ID_ENV,
     PUBLIC_INPUT_RULE,
-    AggregateBinding,
-    bind_aggregate_input,
     SCORE_FELT_LEN,
     decode_score_felt,
-    try_bind_aggregate_input,
     framed_input,
     framed_input_digest,
     journal_hash,
@@ -34,7 +36,7 @@ from kswarm_cli.bonsol import (
     reducer_committed_outputs,
     resolve_aggregate_image_id,
 )
-from kswarm_cli.reducer_image import AGGREGATE_REDUCER_IMAGE_ID
+from kswarm_cli.reducer_image import LEGACY_BRANCH_REDUCER_IMAGE_ID
 
 
 VECTORS = Path(__file__).with_name("vectors") / "bonsol_harness_vectors.json"
@@ -94,15 +96,10 @@ def test_binding_matches_harness_prepare(vector: dict) -> None:
     outputs = reducer_committed_outputs(input_json)
     assert outputs.hex() == prepared["committedOutputs"]
     assert hashlib.sha256(outputs).hexdigest() == prepared["committedOutputsDigest"]
-    image_id = bytes.fromhex(prepared["imageIdBytesHex"])
-    binding = bind_aggregate_input(image_id, input_json)
-    assert binding.image_id.hex() == prepared["imageIdBytesHex"]
-    assert binding.input_digest.hex() == prepared["callbackInputDigest"]
-    assert binding.output_digest.hex() == prepared["committedOutputsDigest"]
     expected_journal = hashlib.sha256(bytes.fromhex(prepared["callbackInputDigest"]) + bytes.fromhex(prepared["committedOutputs"])).hexdigest()
-    assert binding.journal_hash.hex() == expected_journal
+    assert journal_hash(framed_input_digest(input_json), outputs).hex() == expected_journal
     if "journalHash" in vector:
-        assert binding.journal_hash.hex() == vector["journalHash"]
+        assert journal_hash(framed_input_digest(input_json), outputs).hex() == vector["journalHash"]
 
 
 def test_framed_input_is_u64_le_length_then_bytes() -> None:
@@ -188,50 +185,31 @@ def test_journal_hash_rule() -> None:
         journal_hash(digest, b"")
 
 
-def test_bind_aggregate_input_is_internally_consistent() -> None:
-    image_id = bytes.fromhex(AGGREGATE_REDUCER_IMAGE_ID)
-    payload = json.dumps({"schema_version": 2, "combiner": "weighted-mean", "score_hex": VALID_SCORE_HEX}).encode()
-    binding = bind_aggregate_input(image_id, payload)
-    assert isinstance(binding, AggregateBinding)
-    assert binding.input_digest == framed_input_digest(payload)
-    assert binding.committed_outputs == reducer_committed_outputs(payload)
-    assert binding.output_digest == hashlib.sha256(binding.committed_outputs).digest()
-    assert binding.journal_hash == journal_hash(binding.input_digest, binding.committed_outputs)
-    as_json = binding.to_json()
-    assert as_json["image_id"] == AGGREGATE_REDUCER_IMAGE_ID
-    assert as_json["public_input"] == PUBLIC_INPUT_RULE == "input-artifact"
-    assert as_json["framing"] == FRAMING_RULE == "u64le-length-prefix"
-    assert set(as_json) == {"image_id", "input_digest", "committed_outputs", "output_digest", "journal_hash", "public_input", "framing"}
-    with pytest.raises(ValueError, match="32 bytes"):
-        bind_aggregate_input(b"\x00" * 31, payload)
+def test_the_branch_reducer_binding_is_no_longer_reachable_from_the_cli() -> None:
+    """The aggregate path must not be able to bind to the branch reducer again.
 
-
-def test_try_bind_reports_an_input_the_reducer_would_reject() -> None:
-    """`predict open`'s own aggregate artifact is not a branch-reducer input.
-
-    It carries the branch job list, the combiner and its parameters, and no
-    `score_hex`. Binding it to the branch reducer produced a value only while the
-    reducer defaulted every missing field; the reducer now refuses it, so there is no
-    binding to write and `predict open` opens the job unbound instead of funding a job
-    that provably cannot settle.
+    `predict open` used to bind its aggregate artifact to this guest. The artifact
+    carries the branch job list, the combiner and its parameters, and no `score_hex`,
+    so the reducer refuses it and every aggregate job was opened unbound. The binding
+    helpers were removed with that path; `kswarm_cli.aggregate` replaced them.
     """
 
-    image_id = bytes.fromhex(AGGREGATE_REDUCER_IMAGE_ID)
+    import kswarm_cli.bonsol as legacy
+
+    assert not hasattr(legacy, "bind_aggregate_input")
+    assert not hasattr(legacy, "try_bind_aggregate_input")
+    assert not hasattr(legacy, "AggregateBinding")
     aggregate_artifact = next(v for v in _vectors() if v["name"] == "cli-aggregate-input")
     assert aggregate_artifact["accepted"] is False
-    binding, reason = try_bind_aggregate_input(image_id, aggregate_artifact["input_json"].encode("utf-8"))
-    assert binding is None
-    assert reason == aggregate_artifact["error"].removeprefix("Error: ").strip('"')
-
-    bound, reason = try_bind_aggregate_input(image_id, HARNESS_DEFAULT_INPUT.encode("utf-8"))
-    assert bound is not None and reason == ""
+    with pytest.raises(ValueError):
+        reducer_committed_outputs(aggregate_artifact["input_json"].encode("utf-8"))
 
 
 def test_parse_image_id_matches_harness_decode_image_id() -> None:
-    raw = parse_image_id(AGGREGATE_REDUCER_IMAGE_ID)
-    assert raw.hex() == AGGREGATE_REDUCER_IMAGE_ID
-    assert parse_image_id("0x" + AGGREGATE_REDUCER_IMAGE_ID.upper()) == raw
-    assert parse_image_id(f"  {AGGREGATE_REDUCER_IMAGE_ID}\n") == raw
+    raw = parse_image_id(LEGACY_BRANCH_REDUCER_IMAGE_ID)
+    assert raw.hex() == LEGACY_BRANCH_REDUCER_IMAGE_ID
+    assert parse_image_id("0x" + LEGACY_BRANCH_REDUCER_IMAGE_ID.upper()) == raw
+    assert parse_image_id(f"  {LEGACY_BRANCH_REDUCER_IMAGE_ID}\n") == raw
     with pytest.raises(ValueError, match="32 bytes"):
         parse_image_id("abcd")
     with pytest.raises(ValueError, match="not hex"):
@@ -239,15 +217,23 @@ def test_parse_image_id_matches_harness_decode_image_id() -> None:
 
 
 def test_resolve_aggregate_image_id_precedence() -> None:
-    default = bytes.fromhex(AGGREGATE_REDUCER_IMAGE_ID)
+    from kswarm_cli.reducer_image import AGGREGATE_REDUCER_IMAGE_ID
+
     other = "11" * 32
     third = "22" * 32
-    assert resolve_aggregate_image_id(None, {}) == default
-    assert resolve_aggregate_image_id("", {}) == default
     assert resolve_aggregate_image_id(None, {IMAGE_ID_ENV: other}) == bytes.fromhex(other)
     assert resolve_aggregate_image_id(third, {IMAGE_ID_ENV: other}) == bytes.fromhex(third)
     with pytest.raises(ValueError, match=IMAGE_ID_ENV):
         resolve_aggregate_image_id(None, {IMAGE_ID_ENV: "nope"})
     with pytest.raises(ValueError, match="not hex"):
         resolve_aggregate_image_id("nope", {})
-    assert len(default) == 32
+    if AGGREGATE_REDUCER_IMAGE_ID.strip():
+        default = bytes.fromhex(AGGREGATE_REDUCER_IMAGE_ID)
+        assert len(default) == 32
+        assert resolve_aggregate_image_id(None, {}) == default
+        assert resolve_aggregate_image_id("", {}) == default
+    else:
+        # An unset pin fails closed. A zero digest would let any worker claim the
+        # aggregate job and let no marker ever match it.
+        with pytest.raises(ValueError, match="no aggregate reducer image id is pinned"):
+            resolve_aggregate_image_id(None, {})

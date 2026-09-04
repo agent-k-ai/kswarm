@@ -1,28 +1,33 @@
 """Contract for `KSWARM_BONSOL_AGGREGATE_COMMAND`.
 
-`settle_aggregate_proof_job` (solana/programs/kswarm_protocol/src/lib.rs,
-`validate_settle_aggregate_proof_job`) settles an aggregate receipt only when
-the Bonsol marker's `output_digest` equals `sha256(result_bytes)`, its
-`input_digest` equals the job's `input_bundle_hash`, its `image_id` equals
-the job's `required_software_digest`, and its `journal_hash` equals the job's
-`expected_result_hash`. The receipt bytes must therefore BE the reducer's
-committed outputs; digests cannot be placed inside them.
+The hook *executes* the aggregate proof. It does not decide what is proven: the
+aggregate job was opened against the MFA3 artifact by `kswarm predict bind-aggregate`,
+and the runner has already reduced that artifact itself and knows every value the
+Bonsol marker must carry. The hook's job is to get a Bonsol node to run the aggregate
+reducer guest on that artifact so the callback writes the marker.
 
-So the hook binds the execution the only way the program accepts. The runner
-appends one JSON argument (run id, aggregate job, the combiner result and the
-SHA-256 of its canonical MFA2 encoding) to the configured command. The command
-must exit 0 and print exactly one JSON object on stdout with:
+The runner appends one JSON argument to the configured command:
+
+* `run`, `aggregate_job`: the prediction run and its aggregate job pubkey
+* `image_id`: the aggregate reducer image id the job requires, 32-byte hex
+* `input_cid`, `input_artifact_hex`: the artifact, by locator and by value
+* `input_digest`, `committed_outputs`, `output_digest`, `journal_hash`: what the guest
+  will commit, as the runner computed it
+* `result`: the human-readable reduction, for logs
+
+The command must exit 0 and print exactly one JSON object on stdout with:
 
 * `execution_id`: the Bonsol execution id, 1..32 UTF-8 bytes
-* `image_id`, `input_digest`, `output_digest`, `journal_hash`: 32-byte hex,
-  the same fields the on-chain `BonsolAggregateVerification` marker carries
-* `committed_outputs`: hex, 1..512 bytes, the reducer journal outputs
+* `image_id`, `input_digest`, `output_digest`, `journal_hash`: 32-byte hex, the same
+  fields the on-chain `BonsolAggregateVerification` marker carries
+* `committed_outputs`: hex, 1..512 bytes, the guest journal outputs
 
-The runner checks `sha256(committed_outputs) == output_digest` and
-`sha256(input_digest || committed_outputs) == journal_hash` (the harness's
-journal rule), then checks the digests against the aggregate job account, and
-submits `committed_outputs` as the receipt. A hook that fails, or prints
-anything else, fails the aggregation. There is no fallback.
+`parse_hook_output` checks `sha256(committed_outputs) == output_digest` and
+`sha256(input_digest || committed_outputs) == journal_hash`. The runner then checks
+every field against its own reduction and against the job account
+(`check_binding_against_job`), so an execution that proved a different claim, or one
+the program could never settle, is an error. A hook that fails, or prints anything
+else, fails the aggregation. There is no fallback.
 """
 
 from __future__ import annotations

@@ -3,7 +3,7 @@
 The fake interprets every instruction the commands send (`open_job`,
 `commit_input_artifact`, `cancel_open_job`) by its Anchor discriminator and
 keeps job accounts in memory, so the incremental run manifest, the nonce
-collision guard, the Bonsol binding written to the aggregate job, and the
+collision guard, the Bonsol binding `predict bind-aggregate` writes, and the
 interrupt/resume/cancel paths are all exercised without a validator or IPFS.
 """
 
@@ -23,7 +23,8 @@ from solders.pubkey import Pubkey
 from typer.testing import CliRunner
 
 from kswarm_cli import main as cli_main
-from kswarm_cli.bonsol import framed_input_digest, reducer_committed_outputs
+from kswarm_cli.aggregate import aggregate_journal, build_aggregate_artifact
+from kswarm_cli.bonsol import framed_input_digest
 from kswarm_cli.constants import CAPABILITY_CLASS, JOB_CLASS, JOB_STATUS_BY_NAME, KAI_MAINNET_MINT, KSWARM_PROGRAM_ID, SOFTWARE_DIGEST, TOKEN_PROGRAM_ID, ZERO_HASH
 from kswarm_cli.context import CliContext
 from kswarm_cli.encoding import anchor_ix_discriminator, read_string
@@ -133,6 +134,13 @@ class FakeChain:
         self.ipfs[cid] = payload
         return cid
 
+    def ipfs_cat_json(self, url: str, cid: str) -> Any:
+        """`predict bind-aggregate` reads the pinned aggregate plan back before it binds."""
+
+        if cid not in self.ipfs:
+            raise RuntimeError(f"404 Not Found for {cid}")
+        return json.loads(self.ipfs[cid].decode("utf-8"))
+
 
 def _replace(job: JobAccount, **changes: Any) -> JobAccount:
     values = {name: getattr(job, name) for name in JobAccount.__dataclass_fields__}
@@ -161,6 +169,7 @@ def chain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeChain:
     monkeypatch.setattr(cli_main, "fetch_job", fake.fetch_job)
     monkeypatch.setattr(cli_main, "ipfs_check", lambda url: None)
     monkeypatch.setattr(cli_main, "ipfs_add_bytes", fake.ipfs_add)
+    monkeypatch.setattr(cli_main, "_ipfs_cat_json", fake.ipfs_cat_json)
     monkeypatch.setattr(cli_main, "random_base_nonce", lambda branches: 1_000)
 
     def load_wallet(name: str) -> SimpleNamespace:
@@ -182,6 +191,16 @@ def _invoke(*args: str):
 def _payload(result) -> dict[str, Any]:
     assert result.exit_code == 0, f"exit {result.exit_code}\n{result.output}\n{result.exception!r}"
     return json.loads(result.stdout)
+
+
+def _flat(output: str) -> str:
+    """Rich wraps an error inside a box, so match against one unwrapped line."""
+
+    return " ".join(output.replace("\u2502", " ").split())
+
+
+def _save_manifest(run_id: str, run: dict[str, Any]) -> None:
+    (cli_main.PREDICT_RUNS_DIR / f"{run_id}.json").write_text(json.dumps(run), encoding="utf-8")
 
 
 def _manifest(run_id: str) -> dict[str, Any]:
@@ -214,7 +233,7 @@ OPEN_ARGS = [
 ]
 
 
-def test_open_binds_the_aggregate_job_and_writes_a_complete_manifest(chain: FakeChain) -> None:
+def test_open_opens_the_branches_and_plans_the_aggregate(chain: FakeChain) -> None:
     result = _invoke(*OPEN_ARGS, "--combiner", "trimmed-mean", "--trim-bps", "2500")
     payload = _payload(result)
     run_id = payload["parent_run"]
@@ -229,13 +248,12 @@ def test_open_binds_the_aggregate_job_and_writes_a_complete_manifest(chain: Fake
     assert [entry["nonce"] for entry in run["branch_jobs"]] == [1000, 1001, 1002, 1003]
     assert run["aggregate_nonce"] == 1004 and run["aggregate"]["nonce"] == 1004
     assert all(entry["status"] == JOB_COMMITTED for entry in run["branch_jobs"])
-    assert run["aggregate"]["status"] == JOB_COMMITTED
     assert run["parent_manifest"]["combiner_parameters"] == {"trim_bps": 2500}
     assert run["parent_manifest"]["aggregate_image_id"] == AGGREGATE_REDUCER_IMAGE_ID
     assert run["open_parameters"] == {"required_role": "worker-proof", "required_tier": "T1", "claim_window": 100, "execution_window": 200, "challenge_window": 600}
 
-    # Every job is on chain with its input committed.
-    assert len(chain.jobs) == 5
+    # Every branch job is on chain with its input committed.
+    assert len(chain.jobs) == 4
     for entry in run["branch_jobs"]:
         job = chain.jobs[entry["job"]]
         assert job.status == JOB_STATUS_BY_NAME["open"]
@@ -250,49 +268,44 @@ def test_open_binds_the_aggregate_job_and_writes_a_complete_manifest(chain: Fake
         branch_input = json.loads(chain.ipfs[entry["input_cid"]])
         assert branch_input["parameters"]["combiner_parameters"] == {"trim_bps": 2500}
 
-    # The aggregate job carries the Bonsol binding: image id, framed-input digest, journal hash.
-    aggregate = chain.jobs[run["aggregate_job"]]
-    aggregate_input_bytes = chain.ipfs[run["aggregate_input_cid"]]
-    aggregate_input = json.loads(aggregate_input_bytes)
-    assert aggregate_input["combiner"] == "trimmed-mean"
-    assert aggregate_input["combiner_parameters"] == {"trim_bps": 2500}
-    assert aggregate_input["bonsol"] == {"image_id": AGGREGATE_REDUCER_IMAGE_ID, "public_input": "input-artifact", "framing": "u64le-length-prefix"}
-    assert aggregate_input["branch_jobs"] == [
-        {"branch_index": entry["branch_index"], "job": entry["job"], "nonce": entry["nonce"], "input_cid": entry["input_cid"]} for entry in run["branch_jobs"]
-    ]
-    assert aggregate.required_software_digest.hex() == AGGREGATE_REDUCER_IMAGE_ID
-    assert aggregate.input_bundle_hash == framed_input_digest(aggregate_input_bytes)
-    # The reducer this image id names is `protocol/bonsol-branch-reducer`, whose input
-    # is one branch's `{branch_key, child_job_id, parent_request_id, line_count,
-    # word_count, score_hex}`. The aggregate artifact is a different document with no
-    # `score_hex`, so the reducer rejects it and no journal hash exists. Before
-    # `fix/proof-binding` the reducer defaulted every missing field, so the CLI could
-    # write a hash -- one the reducer would never have committed for this input. The
-    # job is now opened with `expected_result_hash` unset, and says so.
-    with pytest.raises(ValueError, match="score_hex must be a string of 64 lowercase hex digits"):
-        reducer_committed_outputs(aggregate_input_bytes)
-    assert aggregate.expected_result_hash == bytes(32)
+    # The aggregate job is planned, not opened. Its input artifact carries the branch
+    # receipts, which do not exist until the branches run, and `open_job` fixes
+    # `input_bundle_hash` and `expected_result_hash` for good.
+    assert run["aggregate_job"] not in chain.jobs
+    assert run["aggregate"]["status"] == JOB_DEFERRED
+    assert run["aggregate"]["input_cid"] is None
+    assert run["aggregate"]["input_bundle_hash"] is None
+    assert run["aggregate"]["expected_result_hash"] is None
+    assert run["aggregate"]["required_software_digest"] == AGGREGATE_REDUCER_IMAGE_ID
+    assert run["aggregate_input_cid"] is None
+    assert run["aggregate_image_id"] == AGGREGATE_REDUCER_IMAGE_ID
     assert run["bonsol"] == {
         "bound": False,
-        "reason": "score_hex must be a string of 64 lowercase hex digits",
+        "reason": "aggregate job is opened by predict bind-aggregate",
         "image_id": AGGREGATE_REDUCER_IMAGE_ID,
     }
-    assert "aggregate job opened UNBOUND" in result.stderr
-    assert "expected_result_hash is unset" in result.stderr
-    assert aggregate.job_class == JOB_CLASS["aggregate-proof"]
-    assert aggregate.required_capability_class_hash == CAPABILITY_CLASS["branch-aggregator-bonsol"]
-    assert (aggregate.reward_amount, aggregate.required_stake, aggregate.challenge_bond) == (2_000_000, 700_000_000, 700_000_000)
-    assert aggregate.input_cid == run["aggregate_input_cid"]
+    assert "predict bind-aggregate" in result.stderr
+
+    # The plan is still pinned, as provenance: it names the branch jobs, the combiner
+    # and the reducer image this run committed to before any branch ran.
+    plan = json.loads(chain.ipfs[run["aggregate_plan_cid"]])
+    assert plan["schema_version"] == 3
+    assert plan["combiner"] == "trimmed-mean"
+    assert plan["combiner_parameters"] == {"trim_bps": 2500}
+    assert plan["bonsol"] == {"image_id": AGGREGATE_REDUCER_IMAGE_ID, "public_input": "input-artifact", "framing": "u64le-length-prefix"}
+    assert plan["branch_jobs"] == [
+        {"branch_index": entry["branch_index"], "job": entry["job"], "nonce": entry["nonce"], "input_cid": entry["input_cid"]} for entry in run["branch_jobs"]
+    ]
 
 
 def test_open_honours_the_image_id_env_and_flag(chain: FakeChain, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KSWARM_AGGREGATE_IMAGE_ID", "11" * 32)
     payload = _payload(_invoke(*OPEN_ARGS))
-    assert chain.jobs[payload["aggregate_job"]].required_software_digest == bytes.fromhex("11" * 32)
+    assert _manifest(payload["parent_run"])["aggregate_image_id"] == "11" * 32
     chain.jobs.clear()
     monkeypatch.setattr(cli_main, "random_base_nonce", lambda branches: 5_000)
     payload = _payload(_invoke(*OPEN_ARGS, "--aggregate-image-id", "22" * 32))
-    assert chain.jobs[payload["aggregate_job"]].required_software_digest == bytes.fromhex("22" * 32)
+    assert _manifest(payload["parent_run"])["aggregate_image_id"] == "22" * 32
     result = _invoke(*OPEN_ARGS, "--aggregate-image-id", "nope")
     assert result.exit_code != 0 and "not hex" in result.output
 
@@ -335,7 +348,7 @@ def test_interrupted_open_is_resumable_and_never_repeats_a_confirmed_step(chain:
     run = _manifest(run_id)
     assert run["status"] == RUN_OPENING
     assert [entry["status"] for entry in run["branch_jobs"]] == [JOB_COMMITTED, JOB_COMMITTED, JOB_PLANNED, JOB_PLANNED]
-    assert run["aggregate"]["status"] == JOB_PLANNED
+    assert run["aggregate"]["status"] == JOB_DEFERRED
     assert len(chain.jobs) == 2
 
     status = _payload(_invoke("predict", "status", run_id))
@@ -345,7 +358,7 @@ def test_interrupted_open_is_resumable_and_never_repeats_a_confirmed_step(chain:
         (JOB_COMMITTED, "open"),
         (JOB_PLANNED, "missing"),
         (JOB_PLANNED, "missing"),
-        (JOB_PLANNED, "missing"),
+        (JOB_DEFERRED, "missing"),
     ]
 
     # Simulate the manifest lagging the chain: branch 2 was opened but not recorded.
@@ -357,16 +370,16 @@ def test_interrupted_open_is_resumable_and_never_repeats_a_confirmed_step(chain:
     resumed = _payload(_invoke("predict", "resume", run_id))
     assert resumed["run_status"] == RUN_OPEN
     assert resumed["parent_run"] == run_id
-    assert chain.opens == opens_before + 2, "only branch 3 and the aggregate needed open_job"
+    assert chain.opens == opens_before + 1, "only branch 3 needed open_job; the aggregate is deferred"
     run = _manifest(run_id)
     assert all(entry["status"] == JOB_COMMITTED for entry in run["branch_jobs"])
-    assert run["aggregate"]["status"] == JOB_COMMITTED
+    assert run["aggregate"]["status"] == JOB_DEFERRED
     assert all(job.status == JOB_STATUS_BY_NAME["open"] for job in chain.jobs.values())
-    assert len(chain.jobs) == 5
+    assert len(chain.jobs) == 4
 
     again = _payload(_invoke("predict", "resume", run_id))
     assert again["status"] == "already-open"
-    assert chain.opens == opens_before + 2
+    assert chain.opens == opens_before + 1
 
 
 def test_resume_checks_wallet_and_cluster(chain: FakeChain, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -411,14 +424,15 @@ def test_cancel_reports_jobs_it_cannot_cancel(chain: FakeChain) -> None:
     claimed_key = payload["branch_jobs"][1]["job"]
     chain.jobs[claimed_key] = _replace(chain.jobs[claimed_key], status=JOB_STATUS_BY_NAME["claimed"])
     cancelled = _payload(_invoke("predict", "cancel", run_id, "--as", "customer"))
-    assert len(cancelled["cancelled_jobs"]) == 4
+    # Three branches on chain; the fourth is claimed and the aggregate was never opened.
+    assert len(cancelled["cancelled_jobs"]) == 3
     assert cancelled["skipped_jobs"] == [{"job": claimed_key, "status": "claimed"}]
     run = _manifest(run_id)
     assert run["branch_jobs"][1]["status"] == JOB_COMMITTED
     assert run["status"] == RUN_CANCELLED
 
 
-def test_deferred_aggregate_is_left_unopened_and_resume_has_nothing_to_do(chain: FakeChain) -> None:
+def test_the_defer_flag_is_accepted_and_changes_nothing(chain: FakeChain) -> None:
     payload = _payload(_invoke(*OPEN_ARGS, "--defer-aggregate-open"))
     run = _manifest(payload["parent_run"])
     assert run["status"] == RUN_OPEN
@@ -459,3 +473,210 @@ def test_job_open_default_nonce_is_random(chain: FakeChain, monkeypatch: pytest.
     )
     assert payload["nonce"] == 77
     assert chain.jobs[payload["job"]].nonce == 77
+
+
+# --- predict bind-aggregate -----------------------------------------------------
+#
+# The aggregate job is opened here, against the MFA3 artifact built from the branch
+# receipts the chain accepted. This is the moment the job becomes provable, and the
+# moment a wrong artifact would fund a job that can never settle, so the command
+# refuses more than it accepts.
+
+
+def _mfb2_scalar_receipt(branch_index: int, value_bps: int) -> bytes:
+    """The `MFB2` bytes a scalar branch submits, built by hand.
+
+    The CLI package has no encoder -- it only reads receipts -- so the test writes the
+    layout `backend/app/protocol/canonical_hash.py` produces.
+    """
+
+    out = bytearray(b"MFB2")
+    out += struct.pack("<BBIB", 2, 1, branch_index, 1)  # version, scalar kind, index, FLAG_SCALAR
+    out += struct.pack("<H", value_bps)
+    out += bytes([branch_index]) + bytes(31)  # stand-in canonical hash
+    return bytes(out)
+
+
+def _settle_branches(chain: FakeChain, run: dict[str, Any], values: list[int]) -> dict[str, bytes]:
+    receipts: dict[str, bytes] = {}
+    for entry, value in zip(run["branch_jobs"], values):
+        receipt = _mfb2_scalar_receipt(entry["branch_index"], value)
+        receipts[entry["job"]] = receipt
+        chain.jobs[entry["job"]] = _replace(
+            chain.jobs[entry["job"]],
+            status=JOB_STATUS_BY_NAME["settled"],
+            output_cid=f"bafyout{entry['branch_index']}",
+            result_bytes=receipt,
+            submitted_result_hash=hashlib.sha256(receipt).digest(),
+        )
+    return receipts
+
+
+def test_bind_aggregate_opens_the_job_against_the_journal_the_guest_will_commit(chain: FakeChain) -> None:
+    run_id = _payload(_invoke(*OPEN_ARGS))["parent_run"]
+    run = _manifest(run_id)
+    _settle_branches(chain, run, [2000, 4000, 6000, 8000])
+
+    payload = _payload(_invoke("predict", "bind-aggregate", run_id))
+    run = _manifest(run_id)
+    aggregate = chain.jobs[run["aggregate_job"]]
+
+    artifact = chain.ipfs[run["aggregate_input_cid"]]
+    journal = aggregate_journal(artifact)
+    assert aggregate.input_bundle_hash == journal.input_digest
+    assert aggregate.expected_result_hash == journal.journal_hash
+    assert aggregate.required_software_digest.hex() == AGGREGATE_REDUCER_IMAGE_ID
+    assert aggregate.required_capability_class_hash == CAPABILITY_CLASS["branch-aggregator-bonsol"]
+    assert aggregate.job_class == JOB_CLASS["aggregate-proof"]
+    assert aggregate.status == JOB_STATUS_BY_NAME["open"]
+    assert aggregate.input_cid == run["aggregate_input_cid"]
+    assert run["aggregate"]["status"] == JOB_COMMITTED
+
+    # The artifact carries the receipts the chain accepted, and the journal is a
+    # function of exactly those bytes.
+    document = json.loads(artifact)
+    assert document["schema"] == "MFA3"
+    assert [branch["branch_index"] for branch in document["branches"]] == [0, 1, 2, 3]
+    for branch in document["branches"]:
+        chain_job = chain.jobs[branch["job"]]
+        assert bytes.fromhex(branch["result_bytes"]) == chain_job.result_bytes
+        assert bytes.fromhex(branch["result_hash"]) == chain_job.submitted_result_hash
+    assert journal.reduction.result_value == 5000
+    assert journal.reduction.branch_count == 4
+    assert run["bonsol"]["bound"] is True
+    assert run["bonsol"]["journal_hash"] == journal.journal_hash.hex()
+    assert payload["bonsol"]["merkle_root"] == journal.reduction.merkle_root.hex()
+
+    # Idempotent: a second call reports the job it already opened.
+    again = _payload(_invoke("predict", "bind-aggregate", run_id))
+    assert again["status"] == "already-bound"
+
+
+def test_bind_aggregate_carries_the_plan_cid_so_the_chain_commits_to_it(chain: FakeChain) -> None:
+    """The artifact names the plan pinned before any branch ran.
+
+    The guest ignores the field, but `input_digest` covers the whole artifact and the
+    job's `input_bundle_hash` is fixed at open time, so this is what puts the combiner
+    and the branch set this run committed to beyond the customer's reach afterwards.
+    """
+
+    run_id = _payload(_invoke(*OPEN_ARGS))["parent_run"]
+    run = _manifest(run_id)
+    plan_cid = run["aggregate_plan_cid"]
+    _settle_branches(chain, run, [2000, 4000, 6000, 8000])
+    _invoke("predict", "bind-aggregate", run_id)
+
+    run = _manifest(run_id)
+    document = json.loads(chain.ipfs[run["aggregate_input_cid"]])
+    assert document["aggregate_plan_cid"] == plan_cid
+    plan = json.loads(chain.ipfs[plan_cid])
+    assert plan["combiner"] == document["combiner"]
+    assert [item["job"] for item in plan["branch_jobs"]] == [b["job"] for b in document["branches"]]
+    # The reduction ignores the field, so the journal is unchanged by carrying it.
+    assert aggregate_journal(chain.ipfs[run["aggregate_input_cid"]]).reduction.branch_count == 4
+
+
+def test_bind_aggregate_refuses_a_combiner_swapped_after_the_branches_ran(chain: FakeChain) -> None:
+    """The results are visible at bind time, so the combiner must still be the planned one."""
+
+    run_id = _payload(_invoke(*OPEN_ARGS))["parent_run"]
+    run = _manifest(run_id)
+    _settle_branches(chain, run, [2000, 4000, 6000, 8000])
+
+    run = _manifest(run_id)
+    run["combiner"] = "trimmed-mean"
+    run["combiner_parameters"] = {"trim_bps": 2500}
+    _save_manifest(run_id, run)
+
+    result = _invoke("predict", "bind-aggregate", run_id)
+    assert result.exit_code != 0
+    message = _flat(result.output)
+    assert "departs from the aggregate plan" in message
+    assert "combiner" in message
+
+
+def test_bind_aggregate_refuses_a_branch_dropped_after_the_branches_ran(chain: FakeChain) -> None:
+    """Dropping the first branches is the case the nonce layout cannot detect.
+
+    Branch nonces are `base .. base+N-1` and the aggregate is `base+N`, so a reader who
+    derives the branch window from the aggregate nonce and the journal's `branch_count`
+    lands on exactly the surviving suffix. Only the plan catches it.
+    """
+
+    run_id = _payload(_invoke(*OPEN_ARGS))["parent_run"]
+    run = _manifest(run_id)
+    _settle_branches(chain, run, [2000, 4000, 6000, 8000])
+
+    run = _manifest(run_id)
+    run["branch_jobs"] = run["branch_jobs"][2:]
+    _save_manifest(run_id, run)
+
+    result = _invoke("predict", "bind-aggregate", run_id)
+    assert result.exit_code != 0
+    message = _flat(result.output)
+    assert "departs from the aggregate plan" in message
+    assert "branch set is not the planned set" in message
+
+
+def test_bind_aggregate_refuses_when_the_pinned_plan_cannot_be_read(chain: FakeChain) -> None:
+    """An unreachable plan is a refusal, not a warning: otherwise hiding it is the attack."""
+
+    run_id = _payload(_invoke(*OPEN_ARGS))["parent_run"]
+    run = _manifest(run_id)
+    _settle_branches(chain, run, [2000, 4000, 6000, 8000])
+    del chain.ipfs[_manifest(run_id)["aggregate_plan_cid"]]
+
+    result = _invoke("predict", "bind-aggregate", run_id)
+    assert result.exit_code != 0
+    assert "cannot read the pinned aggregate plan" in _flat(result.output)
+
+
+def test_bind_aggregate_refuses_a_branch_that_has_not_settled(chain: FakeChain) -> None:
+    run_id = _payload(_invoke(*OPEN_ARGS))["parent_run"]
+    run = _manifest(run_id)
+    _settle_branches(chain, run, [2000, 4000, 6000, 8000])
+    unsettled = run["branch_jobs"][2]["job"]
+    chain.jobs[unsettled] = _replace(chain.jobs[unsettled], status=JOB_STATUS_BY_NAME["claimed"])
+
+    result = _invoke("predict", "bind-aggregate", run_id)
+    assert result.exit_code != 0
+    assert "needs every branch settled" in result.output
+    assert run["aggregate_job"] not in chain.jobs
+
+    allowed = _invoke("predict", "bind-aggregate", run_id, "--allow-completed-branches")
+    assert allowed.exit_code != 0, "claimed is not completed-with-an-attestation either"
+
+
+def test_bind_aggregate_refuses_receipt_bytes_that_do_not_match_the_chain(chain: FakeChain) -> None:
+    run_id = _payload(_invoke(*OPEN_ARGS))["parent_run"]
+    run = _manifest(run_id)
+    _settle_branches(chain, run, [2000, 4000, 6000, 8000])
+    tampered = run["branch_jobs"][0]["job"]
+    chain.jobs[tampered] = _replace(chain.jobs[tampered], submitted_result_hash=bytes.fromhex("aa" * 32))
+
+    result = _invoke("predict", "bind-aggregate", run_id)
+    assert result.exit_code != 0
+    assert "do not hash to submitted_result_hash" in result.output
+    assert run["aggregate_job"] not in chain.jobs
+
+
+def test_bind_aggregate_refuses_an_artifact_the_reducer_would_reject(chain: FakeChain) -> None:
+    """A categorical receipt under a scalar combiner is a job that could never settle."""
+
+    run_id = _payload(_invoke(*OPEN_ARGS))["parent_run"]
+    run = _manifest(run_id)
+    _settle_branches(chain, run, [2000, 4000, 6000, 8000])
+    entry = run["branch_jobs"][1]
+    categorical = bytearray(b"MFB2")
+    categorical += struct.pack("<BBIB", 2, 2, entry["branch_index"], 8)  # categorical kind, FLAG_CATEGORY
+    categorical += bytes([1]) + bytes([entry["branch_index"]]) + bytes(31)
+    chain.jobs[entry["job"]] = _replace(
+        chain.jobs[entry["job"]],
+        result_bytes=bytes(categorical),
+        submitted_result_hash=hashlib.sha256(bytes(categorical)).digest(),
+    )
+
+    result = _invoke("predict", "bind-aggregate", run_id)
+    assert result.exit_code != 0
+    assert "the aggregate reducer would reject this artifact" in result.output
+    assert run["aggregate_job"] not in chain.jobs

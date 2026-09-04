@@ -162,8 +162,8 @@ one two-branch prediction, report, settle, down) and writes a log under
 
 ## Registry and releases
 
-`.forgejo/workflows/containers.yml` builds all four targets on every pull
-request and, on a `v*` tag, pushes them to the Forgejo registry as
+The container release workflow builds all four targets on every pull
+request and, on a `v*` tag, pushes them to the container registry as
 
 ```
 <registry>/<owner>/<repo>/<target>:<tag>
@@ -173,8 +173,8 @@ request and, on a `v*` tag, pushes them to the Forgejo registry as
 `<owner>/<repo>` comes from `GITHUB_REPOSITORY`, lowercased, so renaming the
 repository moves the images with it; only `<registry>` is set in the workflow.
 The digests are recorded in the job summary. The registry token comes
-from the `REGISTRY_USERNAME` / `REGISTRY_PASSWORD` Actions secrets (fleet
-convention); the workflow prints no secret.
+from the `REGISTRY_USERNAME` / `REGISTRY_PASSWORD` Actions secrets; the
+workflow prints no secret.
 
 Run a tagged release instead of building locally:
 

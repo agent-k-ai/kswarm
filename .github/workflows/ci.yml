@@ -2,6 +2,16 @@
 # nothing is tested on a tree that carries key material. The `integration`
 # tests need a validator, an IPFS node, a built program and an LLM endpoint,
 # so they are excluded here and run on hosts that have them.
+#
+# Everything is pinned, and every job reads its own test count back out of the
+# log. A suite that collected nothing exits 0, and so does one that was quietly
+# narrowed, so "the step was green" is not on its own evidence that the tests ran.
+#
+#   runs-on   ubuntu-24.04, not ubuntu-latest: GitHub moves the -latest label
+#             between images (Ubuntu 26.04 is already published) and that would
+#             land here unannounced.
+#   actions   pinned to a commit. A tag can be moved to point anywhere.
+#   uv, node  pinned to a version, not to a range.
 name: ci
 
 on:
@@ -17,13 +27,25 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  UV_VERSION: "0.12.9"
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "22.23.2"
+  # Measured on 2026-09-04 with `-m "not integration"`. Change one of these only
+  # together with the suite it counts.
+  CLI_TEST_COUNT: "315"
+  WORKER_TEST_COUNT: "151"
+  NODE_TEST_COUNT: "44"
+
 jobs:
   secrets:
     name: Key-material gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Self-test the scanner
         run: scripts/check-no-secrets.sh --self-test
       - name: Scan the index
@@ -32,14 +54,17 @@ jobs:
   cli:
     name: CLI unit tests
     needs: secrets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.12"
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
       - name: Install
         working-directory: cli
         run: uv sync --locked --group dev
@@ -50,10 +75,11 @@ jobs:
       # `lib.rs` where the tests look for it; without this the layout tests skip
       # themselves and the encoders go unchecked.
       - name: Check out the program source
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: agent-k-ai/kswarm-protocol
           path: .kswarm-protocol
+          persist-credentials: false
       - name: Place the program source
         run: |
           set -euo pipefail
@@ -64,33 +90,31 @@ jobs:
 
       # Encoder and account layouts asserted against the program source, Bonsol
       # binding vectors, run-manifest logic, command flows against a fake chain.
+      #
+      # The count is the check that the layout tests actually ran: without the
+      # program source they skip themselves, and a skipped test is not a passing
+      # one, so the total falls short and this step fails.
       - name: Test
-        working-directory: cli
-        run: uv run --locked pytest -q -m "not integration"
-
-      # The layout tests skip themselves when the program source is absent, so
-      # a green run proves nothing on its own. Fail if any of them skipped.
-      - name: Assert the layout tests ran
         working-directory: cli
         run: |
           set -euo pipefail
-          out="$(uv run --locked pytest -q tests/test_program_layout.py)"
-          printf '%s\n' "${out}"
-          case "${out}" in
-            *skipped*) echo "::error::the program layout tests skipped; the program source was not placed"; exit 1 ;;
-          esac
+          uv run --locked pytest -q -m "not integration" 2>&1 | tee "${RUNNER_TEMP}/cli.log"
+          ../scripts/ci/assert-test-count.sh pytest "${CLI_TEST_COUNT}" "${RUNNER_TEMP}/cli.log"
 
   worker:
     name: Worker unit tests
     needs: secrets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.12"
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
       - name: Install
         working-directory: worker
         run: uv sync --group dev
@@ -98,19 +122,27 @@ jobs:
       # vendored engine subset at the repository root; see NOTICE.
       - name: Test
         working-directory: worker
-        run: PYTHONPATH="${GITHUB_WORKSPACE}/backend" uv run pytest -q -m "not integration"
+        run: |
+          set -euo pipefail
+          PYTHONPATH="${GITHUB_WORKSPACE}/backend" \
+            uv run pytest -q -m "not integration" 2>&1 | tee "${RUNNER_TEMP}/worker.log"
+          ../scripts/ci/assert-test-count.sh pytest "${WORKER_TEST_COUNT}" "${RUNNER_TEMP}/worker.log"
 
   node:
     name: Node control-plane tests
     needs: secrets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Node
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: "22"
+          persist-credentials: false
+      - name: Install Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      # `--no-package-lock` is what `docker/protocol-node/Dockerfile` does, so the
+      # tests run against the tree the image would install.
       - name: Install
         working-directory: protocol
         run: npm install --no-package-lock --no-audit --no-fund
@@ -121,4 +153,7 @@ jobs:
       # different halves of the suite.
       - name: Test
         working-directory: protocol
-        run: node --test "test/**/*.test.mjs"
+        run: |
+          set -euo pipefail
+          node --test "test/**/*.test.mjs" 2>&1 | tee "${RUNNER_TEMP}/node.log"
+          ../scripts/ci/assert-test-count.sh node "${NODE_TEST_COUNT}" "${RUNNER_TEMP}/node.log"

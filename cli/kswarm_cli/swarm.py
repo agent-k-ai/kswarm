@@ -96,6 +96,7 @@ class BootstrapPlan:
     fund_kai: str | None
     tier_floors: tuple[str, str, str]
     verifier_floor: str
+    min_challenge_window_seconds: int
 
     def wallet_names(self) -> list[str]:
         names = [self.admin, self.customer, *(worker.wallet for worker in self.workers)]
@@ -247,7 +248,12 @@ def _ensure_protocol(
         ctx.save_cluster(ctx.cluster_name, profile)
         summary["protocol"] = {"status": "already-initialized", **existing.to_json()}
         return existing
-    floors = stake_floors_from_human(plan.tier_floors, plan.verifier_floor, mint_info.decimals)
+    floors = stake_floors_from_human(
+        plan.tier_floors,
+        plan.verifier_floor,
+        mint_info.decimals,
+        plan.min_challenge_window_seconds,
+    )
     proto = ProtocolAddresses(ctx.program_id, mint, mint_info.token_program)
     signature = sign_and_send(ctx.rpc, admin.keypair, [initialize_protocol_ix(proto, admin.pubkey, floors)])
     ctx.save_cluster(ctx.cluster_name, {**profile, "admin_wallet": plan.admin})

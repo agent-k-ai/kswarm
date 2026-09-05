@@ -13,7 +13,7 @@ import httpx
 import pytest
 from solders.keypair import Keypair
 
-from kswarm_cli.constants import KSWARM_PROGRAM_ID
+from kswarm_cli.constants import KSWARM_PROGRAM_ID, MIN_CHALLENGE_WINDOW_SECONDS_BY_CLUSTER
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -153,11 +153,15 @@ def ipfs_api_url() -> str:
 
 
 TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+# The local cluster profile's challenge-window floor: small so this suite, the smoke
+# script and the demos still run a job to its challenge deadline in seconds.
+LOCAL_MIN_CHALLENGE_WINDOW = MIN_CHALLENGE_WINDOW_SECONDS_BY_CLUSTER["local"]
 EXPECTED_FLOORS = {
     "tier_one_stake_floor": 50_000_000_000,
     "tier_two_stake_floor": 250_000_000_000,
     "tier_three_stake_floor": 1_000_000_000_000,
     "verifier_stake_floor": 100_000_000_000,
+    "min_challenge_window_seconds": LOCAL_MIN_CHALLENGE_WINDOW,
 }
 
 
@@ -235,7 +239,7 @@ def test_classic_spl_mint_job_lifecycle(cli_home: Path, validator_rpc: str, admi
         "--required-stake",
         "500",
         "--challenge-window",
-        "2",
+        str(LOCAL_MIN_CHALLENGE_WINDOW),
         "--capability",
         "worker-proof",
         "--required-tier",

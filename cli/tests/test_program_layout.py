@@ -225,7 +225,7 @@ VERIFIER_AUTHORITY = Keypair().pubkey()
 CHALLENGER = Keypair().pubkey()
 JOB_KEY = PROTO.job_pda(CUSTOMER, 7)
 MARKER = Keypair().pubkey()
-FLOORS = InitializeProtocolArgs(1, 2, 3, 4)
+FLOORS = InitializeProtocolArgs(1, 2, 3, 4, 5)
 
 
 def _job(**overrides: Any) -> JobAccount:
@@ -278,7 +278,13 @@ JOB = _job()
 CASES: dict[str, tuple[Any, dict[str, Any]]] = {
     "initialize_protocol": (
         initialize_protocol_ix(PROTO, CUSTOMER, FLOORS),
-        {"tier_one_stake_floor": 1, "tier_two_stake_floor": 2, "tier_three_stake_floor": 3, "verifier_stake_floor": 4},
+        {
+            "tier_one_stake_floor": 1,
+            "tier_two_stake_floor": 2,
+            "tier_three_stake_floor": 3,
+            "verifier_stake_floor": 4,
+            "min_challenge_window_seconds": 5,
+        },
     ),
     "register_worker": (
         register_worker_ix(PROTO, WORKER_AUTHORITY, 2, H(1), H(2)),
@@ -433,6 +439,7 @@ def test_raw_record_aggregate_verification_matches_the_fallback(source: str) -> 
                 "tier_two_stake_floor": 2,
                 "tier_three_stake_floor": 3,
                 "verifier_stake_floor": 4,
+                "min_challenge_window_seconds": 5,
             },
         ),
         (

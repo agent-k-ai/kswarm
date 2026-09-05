@@ -33,6 +33,7 @@ from kswarm_cli.constants import (
     LAMPORTS_PER_SOL,
     LOCAL_MINT_DECIMALS,
     MINT_CREATION_CLUSTERS,
+    MIN_CHALLENGE_WINDOW_SECONDS_BY_CLUSTER,
     NODE_ROLE,
     PAYMENT_TOKEN_SYMBOL,
     SOFTWARE_DIGEST,
@@ -97,6 +98,7 @@ from kswarm_cli.protocol import (
     fetch_job,
     fetch_worker,
     initialize_protocol_ix,
+    min_challenge_window_default,
     open_job_ix,
     parse_tier_floors,
     record_aggregate_verification_raw_ix,
@@ -322,6 +324,24 @@ def protocol_initialize(
     verifier_floor: str = typer.Option(
         DEFAULT_VERIFIER_STAKE_FLOOR, "--verifier-floor", help="Verifier stake floor in human units."
     ),
+    min_challenge_window: int | None = typer.Option(
+        None,
+        "--min-challenge-window",
+        min=1,
+        help=(
+            "Smallest challenge window open_job will accept, in seconds. Default: by cluster "
+            f"({', '.join(f'{name} {value}' for name, value in MIN_CHALLENGE_WINDOW_SECONDS_BY_CLUSTER.items())}). "
+            "The unit is one attestation rung (ATTESTATION_WINDOW_SECONDS = 7200 s), the time an "
+            "assigned verifier has to attest before reassign_verifier may replace it; that clock "
+            "starts at the receipt. A window must hold at least one whole rung plus a tail in which "
+            "the resulting challenge can still land. The mainnet default is MAX_REASSIGNMENTS + 2 = 5 "
+            "rungs: one per verifier the reassignment ladder can hold, plus the tail. That multiple "
+            "comes from the design review for requiring a verifier attestation before branch "
+            "settlement, which proposes enforcing it inside the program; that gate is not "
+            "implemented and only this floor is. Local clusters keep a few seconds so tests and "
+            "demos stay fast."
+        ),
+    ),
     i_understand_real_funds: bool = typer.Option(
         False, "--i-understand-real-funds", help="Required on mainnet, where the mint is real KAI."
     ),
@@ -334,6 +354,7 @@ def protocol_initialize(
 
     Example: kswarm protocol initialize --admin admin --payment-mint <mint> --tier-floors 50000,250000,1000000 --verifier-floor 100000
     Example: kswarm --keypair /runtime/protocol/admin.json protocol initialize --payment-mint <mint>
+    Example: kswarm --cluster devnet protocol initialize --payment-mint <mint> --min-challenge-window 14400
     """
     c = _ctx(ctx)
     if c.cluster_name == "mainnet" and not i_understand_real_funds:
@@ -343,7 +364,14 @@ def protocol_initialize(
     mint = Pubkey.from_string(payment_mint)
     try:
         mint_info = fetch_mint_info(rpc, mint)
-        floors = stake_floors_from_human(parse_tier_floors(tier_floors), verifier_floor, mint_info.decimals)
+        floors = stake_floors_from_human(
+            parse_tier_floors(tier_floors),
+            verifier_floor,
+            mint_info.decimals,
+            min_challenge_window
+            if min_challenge_window is not None
+            else min_challenge_window_default(c.cluster_name),
+        )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     profile = {
@@ -370,6 +398,7 @@ def protocol_initialize(
             "payment_mint": str(mint),
             "token_program": str(mint_info.token_program),
             "payment_decimals": mint_info.decimals,
+            # `to_json()` carries the challenge-window floor alongside the four stake floors.
             "stake_floors": floors.to_json(),
         },
     )
@@ -630,7 +659,7 @@ def job_open(
 ) -> None:
     """Open and escrow a job.
 
-    Example: kswarm job open --as customer --class branch-proof --reward 25 --required-stake 500 --challenge-window 2 --capability worker-proof
+    Example: kswarm job open --as customer --class branch-proof --reward 25 --required-stake 500 --challenge-window 30 --capability worker-proof
     """
     c = _ctx(ctx)
     rpc = _rpc(c)
@@ -985,6 +1014,12 @@ def swarm_bootstrap(
     fund_kai: str | None = typer.Option("300000", "--fund-kai", help="Target KAI per non-admin wallet (stand-in mints only). Empty disables."),
     tier_floors: str = typer.Option(",".join(DEFAULT_TIER_STAKE_FLOORS), "--tier-floors", help="Tier floors in human units, comma-separated."),
     verifier_floor: str = typer.Option(DEFAULT_VERIFIER_STAKE_FLOOR, "--verifier-floor", help="Verifier floor in human units."),
+    min_challenge_window: int | None = typer.Option(
+        None,
+        "--min-challenge-window",
+        min=1,
+        help="Smallest challenge window open_job will accept, in seconds. Default: by cluster. See protocol initialize --help.",
+    ),
     worker_stake: str | None = typer.Option(None, "--worker-stake", help="Target branch-worker stake in KAI. Default: tier-one floor."),
     verifier_stake: str | None = typer.Option(None, "--verifier-stake", help="Target verifier stake in KAI. Default: verifier floor."),
     aggregator_stake: str | None = typer.Option(None, "--aggregator-stake", help="Target aggregator stake in KAI. Default: tier-one floor."),
@@ -1024,6 +1059,11 @@ def swarm_bootstrap(
         fund_kai=fund_kai or None,
         tier_floors=floors,
         verifier_floor=verifier_floor,
+        min_challenge_window_seconds=(
+            min_challenge_window
+            if min_challenge_window is not None
+            else min_challenge_window_default(c.cluster_name)
+        ),
     )
     context = BootstrapContext(
         cluster_name=c.cluster_name,

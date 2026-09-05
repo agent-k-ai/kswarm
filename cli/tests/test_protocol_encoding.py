@@ -22,6 +22,7 @@ from kswarm_cli.encoding import (
     format_token_amount,
     parse_base_units,
     parse_token_amount,
+    u32,
     u64,
     u8,
 )
@@ -36,6 +37,7 @@ from kswarm_cli.protocol import (
     decode_config,
     initialize_protocol_ix,
     job_pda,
+    min_challenge_window_default,
     parse_tier_floors,
     program_data_pda,
     register_worker_ix,
@@ -49,22 +51,29 @@ from kswarm_cli.spl_token import associated_token_address
 
 PROGRAM_ID = KSWARM_PROGRAM_ID
 OTHER_PROGRAM_ID = Pubkey.from_string("BoNsHRcyLLNdtnoDf8hiCNZpyehMC4FDMxs6NTxFi3ew")
-DEFAULT_FLOORS = InitializeProtocolArgs(50_000_000_000, 250_000_000_000, 1_000_000_000_000, 100_000_000_000)
+DEFAULT_FLOORS = InitializeProtocolArgs(50_000_000_000, 250_000_000_000, 1_000_000_000_000, 100_000_000_000, 5)
 
 
 def _proto(token_program: Pubkey = TOKEN_PROGRAM_ID) -> ProtocolAddresses:
     return ProtocolAddresses(PROGRAM_ID, KAI_MAINNET_MINT, token_program)
 
 
-def test_initialize_args_encode_as_four_little_endian_u64() -> None:
+def test_initialize_args_encode_as_four_little_endian_u64_then_the_window_floor() -> None:
     data = DEFAULT_FLOORS.to_bytes()
-    assert len(data) == 32
-    assert data == u64(50_000_000_000) + u64(250_000_000_000) + u64(1_000_000_000_000) + u64(100_000_000_000)
+    assert len(data) == 36
+    assert data == (
+        u64(50_000_000_000)
+        + u64(250_000_000_000)
+        + u64(1_000_000_000_000)
+        + u64(100_000_000_000)
+        + u32(5)
+    )
     assert DEFAULT_FLOORS.to_json() == {
         "tier_one_stake_floor": 50_000_000_000,
         "tier_two_stake_floor": 250_000_000_000,
         "tier_three_stake_floor": 1_000_000_000_000,
         "verifier_stake_floor": 100_000_000_000,
+        "min_challenge_window_seconds": 5,
     }
 
 
@@ -200,6 +209,7 @@ def test_decode_config_reads_new_layout() -> None:
         tier_two_stake_floor=250_000_000_000,
         tier_three_stake_floor=1_000_000_000_000,
         verifier_stake_floor=100_000_000_000,
+        min_challenge_window_seconds=5,
     )
     assert account.to_json()["token_program"] == str(TOKEN_PROGRAM_ID)
     assert account.addresses(PROGRAM_ID) == _proto()
@@ -229,11 +239,11 @@ def test_parse_tier_floors_rejects_wrong_arity(text: str) -> None:
 
 
 def test_stake_floors_from_human_uses_mint_decimals() -> None:
-    assert stake_floors_from_human(("50000", "250000", "1000000"), "100000", 6) == DEFAULT_FLOORS
-    nine = stake_floors_from_human(("500", "2500", "10000"), "1000", 9)
+    assert stake_floors_from_human(("50000", "250000", "1000000"), "100000", 6, 5) == DEFAULT_FLOORS
+    nine = stake_floors_from_human(("500", "2500", "10000"), "1000", 9, 5)
     assert nine.tier_one_stake_floor == 500 * 10**9
     assert nine.verifier_stake_floor == 1000 * 10**9
-    fractional = stake_floors_from_human(("0.5", "1", "1.5"), "0.25", 6)
+    fractional = stake_floors_from_human(("0.5", "1", "1.5"), "0.25", 6, 5)
     assert fractional.tier_one_stake_floor == 500_000
     assert fractional.verifier_stake_floor == 250_000
 
@@ -249,12 +259,38 @@ def test_stake_floors_from_human_uses_mint_decimals() -> None:
 )
 def test_stake_floors_from_human_rejects_bad_floors(tiers: tuple[str, str, str], verifier: str, message: str) -> None:
     with pytest.raises(ValueError, match=message):
-        stake_floors_from_human(tiers, verifier, 6)
+        stake_floors_from_human(tiers, verifier, 6, 5)
 
 
 def test_validate_stake_floors_rejects_u64_overflow() -> None:
     with pytest.raises(ValueError, match="u64"):
-        validate_stake_floors(InitializeProtocolArgs(1, 2, 2**64, 1))
+        validate_stake_floors(InitializeProtocolArgs(1, 2, 2**64, 1, 5))
+
+
+@pytest.mark.parametrize("seconds", [0, -1, 2**32])
+def test_validate_stake_floors_rejects_an_unusable_challenge_window_floor(seconds: int) -> None:
+    """A zero floor would restore the unbounded `challenge_window_seconds > 0` behaviour."""
+    with pytest.raises(ValueError, match="minimum challenge window"):
+        validate_stake_floors(InitializeProtocolArgs(1, 2, 3, 4, seconds))
+
+
+def test_min_challenge_window_default_is_small_locally_and_a_full_ladder_on_mainnet() -> None:
+    # Local stays fast; devnet holds one attestation rung plus a challenge tail; mainnet
+    # holds one rung per verifier the ladder can carry, plus the tail.
+    attestation_window = 7200
+    max_reassignments = 3
+    assert min_challenge_window_default("local") == 5
+    assert min_challenge_window_default("devnet") == 2 * attestation_window
+    assert min_challenge_window_default("mainnet") == (max_reassignments + 2) * attestation_window
+    # An unrecognized profile must not silently get the local value.
+    assert min_challenge_window_default("staging") == min_challenge_window_default("mainnet")
+
+
+def test_initialize_protocol_args_encode_the_challenge_window_floor() -> None:
+    """The floor is the trailing u32 of the instruction payload."""
+    args = InitializeProtocolArgs(1, 2, 3, 4, 36_000)
+    assert args.to_bytes()[-4:] == u32(36_000)
+    assert len(args.to_bytes()) == 4 * 8 + 4
 
 
 def test_protocol_addresses_derive_atas_with_their_token_program() -> None:
@@ -328,6 +364,8 @@ def test_claim_job_ix_carries_config_token_program() -> None:
         "ChallengeRequiresAssignedVerifier",
         "ProgramDataMismatch",
         "AdminNotUpgradeAuthority",
+        "ChallengeWindowBelowFloor",
+        "InvalidChallengeWindowFloor",
     ],
 )
 def test_new_program_errors_decode_by_anchor_index(name: str) -> None:
@@ -338,7 +376,7 @@ def test_new_program_errors_decode_by_anchor_index(name: str) -> None:
 
 def test_program_error_order_is_append_only() -> None:
     # Anchor error codes are positional; the PR-1, PR-2, and PR-3 variants must stay at the tail.
-    tail = PROTOCOL_ERRORS[-12:]
+    tail = PROTOCOL_ERRORS[-14:]
     assert tail[0] == "JobWorkerMismatch"
     assert tail[7] == "ForbiddenMintExtension"
     assert tail[8:] == [
@@ -346,8 +384,10 @@ def test_program_error_order_is_append_only() -> None:
         "ChallengeRequiresAssignedVerifier",
         "ProgramDataMismatch",
         "AdminNotUpgradeAuthority",
+        "ChallengeWindowBelowFloor",
+        "InvalidChallengeWindowFloor",
     ]
-    assert PROTOCOL_ERRORS.index("AggregateProofRequiresAggregateSettlement") == len(PROTOCOL_ERRORS) - 13
+    assert PROTOCOL_ERRORS.index("AggregateProofRequiresAggregateSettlement") == len(PROTOCOL_ERRORS) - 15
 
 
 def test_parse_base_units_truncates_and_allows_zero() -> None:

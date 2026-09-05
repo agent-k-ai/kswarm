@@ -24,15 +24,15 @@ Amounts are human units of the payment token (KAI, 6 decimals; stand-in mints on
 | `token mint <amount> --to <name>` | Mint stand-in tokens to a wallet ATA on `local` or `devnet`. Refused elsewhere. | pytest |
 | `token transfer <amount> --from <name> --to <name>` | Transfer KAI between wallets. | smoke |
 | `token balance <name>` | Show KAI token balance. | pytest |
-| `protocol initialize [--admin <name>] --payment-mint <pubkey> [--tier-floors 50000,250000,1000000] [--verifier-floor 100000] [--i-understand-real-funds]` | Initialize the protocol config PDA. The signer must be the program's upgrade authority: `--admin` names a wallet, else the global `--keypair` file or the active wallet signs. Floors are human units, converted with the mint's on-chain decimals. `--i-understand-real-funds` is required on `mainnet`. | pytest |
+| `protocol initialize [--admin <name>] --payment-mint <pubkey> [--tier-floors 50000,250000,1000000] [--verifier-floor 100000] [--min-challenge-window <seconds>] [--i-understand-real-funds]` | Initialize the protocol config PDA. The signer must be the program's upgrade authority: `--admin` names a wallet, else the global `--keypair` file or the active wallet signs. Floors are human units, converted with the mint's on-chain decimals. `--min-challenge-window` is the smallest challenge window `open_job` will accept; it defaults by cluster (local 5 s, devnet 14400 s, mainnet 36000 s) and is explained in [KAI Payment Token](kai-payment-token.md#the-challenge-window-floor-is-a-config-value-too). `--i-understand-real-funds` is required on `mainnet`. | pytest |
 | `protocol show` | Decode the protocol config PDA. | smoke |
 | `protocol runtime-config --output <path> [--artifact-gateway-url <url>]` | Write the on-chain config as the `protocol.json` the Node api and watcher read (mint, token program, decimals, floors, program id, RPC URL). | pytest + node --test |
-| `swarm bootstrap [--branch-worker <name>]... [--verifier <name>] [--aggregator <name>] [--payment-mint <pubkey>] [--fund-kai <amount>] [--airdrop-sol <sol>] [--worker-stake ...] [--aggregate-image-id <hex>]` | Bring a `local` or `devnet` swarm to ready in one idempotent pass: wallets, SOL, stand-in mint, `initialize_protocol` with the KAI floors, funding, registration, and stake. Refused on `mainnet`. | pytest (fake chain) |
+| `swarm bootstrap [--branch-worker <name>]... [--verifier <name>] [--aggregator <name>] [--payment-mint <pubkey>] [--fund-kai <amount>] [--airdrop-sol <sol>] [--worker-stake ...] [--min-challenge-window <seconds>] [--aggregate-image-id <hex>]` | Bring a `local` or `devnet` swarm to ready in one idempotent pass: wallets, SOL, stand-in mint, `initialize_protocol` with the KAI floors, funding, registration, and stake. Refused on `mainnet`. | pytest (fake chain) |
 | `worker register --as <name> --role ... --capability ... --software-digest ...` | Register a worker/verifier PDA. | pytest |
 | `worker show <pubkey-or-name>` | Decode worker state. | smoke |
 | `worker stake <amount> --as <name>` | Deposit unlocked worker stake. | pytest |
 | `worker withdraw-stake <amount> --as <name>` | Withdraw unlocked worker stake. | smoke |
-| `job open ...` | Open and escrow a job. | pytest |
+| `job open ...` | Open and escrow a job. `--challenge-window` must be at least the config's `min_challenge_window_seconds`, else `ChallengeWindowBelowFloor`. | pytest |
 | `job commit-input --job <pubkey> --cid <cid> --as <customer>` | Move job from awaiting artifact to open. | pytest |
 | `job show <pubkey>` | Decode job state. | pytest |
 | `job list [--status ...] [--customer ...]` | List program job accounts. | smoke |

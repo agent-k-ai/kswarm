@@ -41,6 +41,7 @@ CONFIG = ProtocolConfigAccount(
     tier_two_stake_floor=250_000_000_000,
     tier_three_stake_floor=1_000_000_000_000,
     verifier_stake_floor=100_000_000_000,
+    min_challenge_window_seconds=36_000,
 )
 
 

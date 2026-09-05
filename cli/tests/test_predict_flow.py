@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import struct
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ import pytest
 from rich.console import Console
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
+from typer import rich_utils
 from typer.testing import CliRunner
 
 from kswarm_cli import main as cli_main
@@ -193,10 +195,17 @@ def _payload(result) -> dict[str, Any]:
     return json.loads(result.stdout)
 
 
-def _flat(output: str) -> str:
-    """Rich wraps an error inside a box, so match against one unwrapped line."""
+# CSI and OSC escape sequences. Typer builds its error console with
+# `force_terminal=True` whenever GITHUB_ACTIONS, FORCE_COLOR or PY_COLORS is set
+# (`typer.rich_utils.FORCE_TERMINAL`), so on a hosted runner the same message
+# arrives coloured as well as boxed, and colour lands in the middle of a word.
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
-    return " ".join(output.replace("\u2502", " ").split())
+
+def _flat(output: str) -> str:
+    """The message as text: Rich colours it and wraps it in a box, so undo both."""
+
+    return " ".join(_ANSI.sub("", output).replace("\u2502", " ").split())
 
 
 def _save_manifest(run_id: str, run: dict[str, Any]) -> None:
@@ -307,7 +316,7 @@ def test_open_honours_the_image_id_env_and_flag(chain: FakeChain, monkeypatch: p
     payload = _payload(_invoke(*OPEN_ARGS, "--aggregate-image-id", "22" * 32))
     assert _manifest(payload["parent_run"])["aggregate_image_id"] == "22" * 32
     result = _invoke(*OPEN_ARGS, "--aggregate-image-id", "nope")
-    assert result.exit_code != 0 and "not hex" in result.output
+    assert result.exit_code != 0 and "not hex" in _flat(result.output)
 
 
 @pytest.mark.parametrize(
@@ -324,9 +333,32 @@ def test_open_honours_the_image_id_env_and_flag(chain: FakeChain, monkeypatch: p
 def test_open_rejects_bad_combiner_settings_before_any_transaction(chain: FakeChain, extra: list[str], message: str) -> None:
     result = _invoke(*OPEN_ARGS, *extra)
     assert result.exit_code != 0
-    assert message in result.output
+    assert message in _flat(result.output)
     assert chain.opens == 0 and not chain.jobs
     assert not list(cli_main.PREDICT_RUNS_DIR.glob("*.json")) if cli_main.PREDICT_RUNS_DIR.exists() else True
+
+
+def test_error_messages_survive_the_rendering_a_hosted_runner_forces(
+    chain: FakeChain, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The published CI runs with GITHUB_ACTIONS set, and typer renders differently there.
+
+    `typer.rich_utils.FORCE_TERMINAL` is true whenever GITHUB_ACTIONS, FORCE_COLOR
+    or PY_COLORS is set, and the error console is built from it on every render.
+    The message then arrives coloured and wrapped in a box, with escape sequences
+    at every line break, which is what made five assertions in this file fail on
+    every run the public `kswarm` workflow ever executed while the same tests
+    passed on a build host. Assertions go through `_flat`, so they must not.
+    """
+
+    monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", True)
+    monkeypatch.setattr(rich_utils, "MAX_WIDTH", 80)
+
+    result = _invoke(*OPEN_ARGS, "--combiner", "trimmed-mean", "--trim-bps", "10000")
+    assert result.exit_code != 0
+    assert "\x1b[" in result.output, "typer rendered no escape sequences; this test would prove nothing"
+    assert "trim-bps" not in result.output, "the message was not wrapped; this test would prove nothing"
+    assert "trim-bps" in _flat(result.output)
 
 
 def test_open_refuses_a_nonce_collision_before_spending_escrow(chain: FakeChain) -> None:
@@ -334,7 +366,8 @@ def test_open_refuses_a_nonce_collision_before_spending_escrow(chain: FakeChain)
     chain.jobs[colliding] = _job_account(1_002, chain.customer, bytes(183))  # type: ignore[attr-defined]
     result = _invoke(*OPEN_ARGS)
     assert result.exit_code != 0
-    assert "nonce collision" in result.output and colliding in result.output
+    message = _flat(result.output)
+    assert "nonce collision" in message and colliding in message
     assert chain.opens == 0
     assert not list(cli_main.PREDICT_RUNS_DIR.glob("*.json"))
 
@@ -388,14 +421,14 @@ def test_resume_checks_wallet_and_cluster(chain: FakeChain, monkeypatch: pytest.
     run_id = result.stderr.splitlines()[0].split()[0].removeprefix("parent_run=")
     chain.fail_after_opens = None
     wrong = _invoke("predict", "resume", run_id, "--as", "other")
-    assert wrong.exit_code != 0 and "not the run customer" in wrong.output
+    assert wrong.exit_code != 0 and "not the run customer" in _flat(wrong.output)
     run = _manifest(run_id)
     run["cluster"] = "devnet"
     cli_main.save_run_manifest(cli_main.PREDICT_RUNS_DIR / f"{run_id}.json", run)
     wrong_cluster = _invoke("predict", "resume", run_id)
-    assert wrong_cluster.exit_code != 0 and "--cluster devnet" in wrong_cluster.output
+    assert wrong_cluster.exit_code != 0 and "--cluster devnet" in _flat(wrong_cluster.output)
     missing = _invoke("predict", "resume", "nope")
-    assert missing.exit_code != 0 and "unknown local prediction run" in missing.output
+    assert missing.exit_code != 0 and "unknown local prediction run" in _flat(missing.output)
 
 
 def test_cancel_unwinds_a_partial_run_and_blocks_resume(chain: FakeChain) -> None:
@@ -415,7 +448,7 @@ def test_cancel_unwinds_a_partial_run_and_blocks_resume(chain: FakeChain) -> Non
     assert run["aggregate"]["status"] == JOB_CANCELLED
     assert all(job.status == JOB_STATUS_BY_NAME["cancelled"] for job in chain.jobs.values())
     blocked = _invoke("predict", "resume", run_id)
-    assert blocked.exit_code != 0 and "cancelled" in blocked.output
+    assert blocked.exit_code != 0 and "cancelled" in _flat(blocked.output)
 
 
 def test_cancel_reports_jobs_it_cannot_cancel(chain: FakeChain) -> None:
@@ -463,7 +496,7 @@ def test_legacy_schema_one_manifest_still_reports_status_and_refuses_resume(chai
     assert status["run_status"] == RUN_OPEN
     assert [row["kind"] for row in status["jobs"]] == ["branch"]
     blocked = _invoke("predict", "resume", legacy["parent_run"])
-    assert blocked.exit_code != 0 and "schema 1" in blocked.output
+    assert blocked.exit_code != 0 and "schema 1" in _flat(blocked.output)
 
 
 def test_job_open_default_nonce_is_random(chain: FakeChain, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -640,7 +673,7 @@ def test_bind_aggregate_refuses_a_branch_that_has_not_settled(chain: FakeChain) 
 
     result = _invoke("predict", "bind-aggregate", run_id)
     assert result.exit_code != 0
-    assert "needs every branch settled" in result.output
+    assert "needs every branch settled" in _flat(result.output)
     assert run["aggregate_job"] not in chain.jobs
 
     allowed = _invoke("predict", "bind-aggregate", run_id, "--allow-completed-branches")
@@ -656,7 +689,7 @@ def test_bind_aggregate_refuses_receipt_bytes_that_do_not_match_the_chain(chain:
 
     result = _invoke("predict", "bind-aggregate", run_id)
     assert result.exit_code != 0
-    assert "do not hash to submitted_result_hash" in result.output
+    assert "do not hash to submitted_result_hash" in _flat(result.output)
     assert run["aggregate_job"] not in chain.jobs
 
 
@@ -678,5 +711,5 @@ def test_bind_aggregate_refuses_an_artifact_the_reducer_would_reject(chain: Fake
 
     result = _invoke("predict", "bind-aggregate", run_id)
     assert result.exit_code != 0
-    assert "the aggregate reducer would reject this artifact" in result.output
+    assert "the aggregate reducer would reject this artifact" in _flat(result.output)
     assert run["aggregate_job"] not in chain.jobs

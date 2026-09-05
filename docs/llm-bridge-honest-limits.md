@@ -105,12 +105,7 @@ If the OASIS/Zep stack is unavailable, the worker fails the job execution path r
 
 `settle_aggregate_proof_job` requires the Bonsol marker's `output_digest` to equal `sha256(result_bytes)`. The aggregate receipt bytes must therefore be the reducer's committed outputs; the execution id and digests cannot live inside the receipt. The runner binds the execution by running `KSWARM_BONSOL_AGGREGATE_COMMAND`, validating the returned `committed_outputs` against `output_digest` and `journal_hash`, checking the digests against the aggregate job account, and submitting those bytes. The full result (combiner, parameters, values, binding) is in the IPFS aggregate artifact referenced by the receipt's `output_cid`. A failed hook fails the aggregation; nothing is claimed.
 
-Known gaps:
-
-- `predict open` opens the aggregate job with a zero `required_software_digest`, a zero `expected_result_hash`, and `input_bundle_hash = sha256(aggregate-input.json)`. Such a job cannot settle through `settle_aggregate_proof_job`, whatever the runner submits, because the marker's `image_id`, `journal_hash`, and `input_digest` can never match it. The flagship demo avoids this with `--defer-aggregate-open` and a manual `job open` that binds the reducer image id, framed-input digest, and journal hash. The CLI needs the same binding for production runs.
-- `trimmed-mean` requires `parent_manifest.combiner_parameters.trim_bps` (Phase 1 ADR: manifests must bind trim basis points). `predict open` does not write it yet, so a `trimmed-mean` run fails closed until the CLI binds it.
-- `weighted-mean` uses uniform weights because the manifest carries no per-branch weights. The result records `combiner_parameters.weights = "uniform"`.
-- Without the hook, the runner submits canonical `MFA2` bytes with `receipt_binding: mfa2-canonical-unbound` and a warning. That receipt is for local development only and cannot settle through `settle_aggregate_proof_job`.
+The open items on this path are recorded in [Proof Layer Status](proof-layer-status.md), which is where they are kept up to date.
 
 ## Deferred Work
 

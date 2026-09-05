@@ -27,6 +27,7 @@ from kswarm_cli.constants import (
     CAPABILITY_CLASS,
     LAMPORTS_PER_SOL,
     KSWARM_PROGRAM_ID,
+    MIN_CHALLENGE_WINDOW_SECONDS_BY_CLUSTER,
     NODE_ROLE,
     SOFTWARE_DIGEST,
     TOKEN_PROGRAM_ID,
@@ -127,7 +128,7 @@ class FakeChain:
         disc = data[:8]
         if disc == INITIALIZE:
             assert self.config is None, "initialize_protocol twice"
-            floors = struct.unpack_from("<QQQQ", data, 8)
+            floors = struct.unpack_from("<QQQQI", data, 8)
             mint = ix.accounts[2].pubkey
             self.config = ProtocolConfigAccount(
                 bump=255,
@@ -139,6 +140,7 @@ class FakeChain:
                 tier_two_stake_floor=floors[1],
                 tier_three_stake_floor=floors[2],
                 verifier_stake_floor=floors[3],
+                min_challenge_window_seconds=floors[4],
             )
         elif disc == REGISTER:
             worker = str(ix.accounts[3].pubkey)
@@ -218,6 +220,7 @@ def _plan(**overrides: Any) -> BootstrapPlan:
         "fund_kai": "300000",
         "tier_floors": ("50000", "250000", "1000000"),
         "verifier_floor": "100000",
+        "min_challenge_window_seconds": 5,
     }
     values.update(overrides)
     return BootstrapPlan(**values)
@@ -258,6 +261,7 @@ def test_fresh_cluster_converges_to_ready(chain: FakeChain) -> None:
     assert chain.config.tier_two_stake_floor == 250_000 * KAI
     assert chain.config.tier_three_stake_floor == 1_000_000 * KAI
     assert chain.config.verifier_stake_floor == 100_000 * KAI
+    assert chain.config.min_challenge_window_seconds == 5
     assert ctx.cluster_config["admin_wallet"] == "admin"
 
     # 4. every non-admin wallet was funded to the target
@@ -471,6 +475,8 @@ def test_command_builds_the_documented_plan(monkeypatch: pytest.MonkeyPatch) -> 
     assert plan.airdrop_sol == 20.0 and plan.create_mint and plan.create_wallets
     assert plan.fund_kai == "300000"
     assert plan.tier_floors == ("50000", "250000", "1000000") and plan.verifier_floor == "100000"
+    # The challenge-window floor defaults from the cluster profile, not from a constant.
+    assert plan.min_challenge_window_seconds == MIN_CHALLENGE_WINDOW_SECONDS_BY_CLUSTER["local"]
     assert [spec.wallet for spec in plan.workers] == ["worker-a", "worker-b", "verifier", "aggregator"]
     assert plan.workers[0] == WorkerSpec("worker-a", "worker-proof", "worker-proof", "worker-canonical", "250000")
     assert plan.workers[2] == WorkerSpec("verifier", "verifier", "worker-proof", "worker-canonical", None)
@@ -485,6 +491,19 @@ def test_command_builds_the_documented_plan(monkeypatch: pytest.MonkeyPatch) -> 
     plan = captured["plan"]
     assert [spec.wallet for spec in plan.workers] == ["worker-a"]
     assert plan.fund_kai is None and plan.airdrop_sol == 0.0
+
+    overridden = CliRunner().invoke(
+        cli_main.app,
+        ["--json", "swarm", "bootstrap", "--min-challenge-window", "900"],
+    )
+    assert overridden.exit_code == 0, overridden.output
+    assert captured["plan"].min_challenge_window_seconds == 900
+
+    below_one = CliRunner().invoke(
+        cli_main.app,
+        ["--json", "swarm", "bootstrap", "--min-challenge-window", "0"],
+    )
+    assert below_one.exit_code != 0
 
     refused = CliRunner().invoke(cli_main.app, ["--json", "swarm", "bootstrap", "--aggregate-image-id", "zz"])
     assert refused.exit_code != 0

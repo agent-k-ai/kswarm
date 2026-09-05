@@ -35,6 +35,36 @@ MINT_CREATION_CLUSTERS = frozenset({"local", "devnet"})
 DEFAULT_TIER_STAKE_FLOORS = ("50000", "250000", "1000000")
 DEFAULT_VERIFIER_STAKE_FLOOR = "100000"
 
+# `ProtocolConfig.min_challenge_window_seconds`: the smallest challenge window `open_job`
+# accepts. Like the stake floors it is an `initialize_protocol` argument, not a program
+# constant, because the smallest window in which verification is genuinely reachable
+# differs by cluster.
+#
+# The unit is one attestation rung, `ATTESTATION_WINDOW_SECONDS` = 7200 s: the time an
+# assigned verifier has to attest before `reassign_verifier` may replace it. The clock for
+# that rung starts at the receipt, so a window has to hold at least one whole rung before
+# any verifier can be expected to attest, plus a tail in which the resulting challenge can
+# still land -- `challenge_deadline` bounds `challenge_job` as well.
+#
+#   local    5 s   Not a real bound. The suite, `scripts/swarm-smoke.sh` and the demos run
+#                  whole jobs in seconds, and a real floor would make every local run wait
+#                  hours. Local clusters carry no value.
+#   devnet   14400 One rung for the assigned verifier plus one full window of challenge
+#                  tail. Verification is genuinely reachable; the full reassignment ladder
+#                  is not guaranteed to fit, which is the price of devnet turnaround.
+#   mainnet  36000 `MAX_REASSIGNMENTS + 2 = 5` rungs: one per verifier the ladder can hold
+#                  (the initial assignment plus three replacements) and one window of
+#                  challenge tail. This is the multiple the design review for requiring a
+#                  verifier attestation before branch settlement derives; that review
+#                  proposes enforcing the multiple inside the program, against a per-job
+#                  attestation window, which is NOT adopted here. The program compares
+#                  only against the configured floor.
+#
+# Override at initialization with `--min-challenge-window`.
+MIN_CHALLENGE_WINDOW_SECONDS_BY_CLUSTER = {"local": 5, "devnet": 14400, "mainnet": 36000}
+# Used for a cluster profile that is none of the three above.
+DEFAULT_MIN_CHALLENGE_WINDOW_SECONDS = MIN_CHALLENGE_WINDOW_SECONDS_BY_CLUSTER["mainnet"]
+
 ZERO_HASH = bytes(32)
 LAMPORTS_PER_SOL = 1_000_000_000
 
@@ -175,4 +205,6 @@ PROTOCOL_ERRORS = [
     "ChallengeRequiresAssignedVerifier",
     "ProgramDataMismatch",
     "AdminNotUpgradeAuthority",
+    "ChallengeWindowBelowFloor",
+    "InvalidChallengeWindowFloor",
 ]

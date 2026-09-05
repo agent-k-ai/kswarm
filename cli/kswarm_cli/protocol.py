@@ -12,8 +12,10 @@ from solders.system_program import ID as SYSTEM_PROGRAM_ID
 from kswarm_cli.constants import (
     ASSOCIATED_TOKEN_PROGRAM_ID,
     BPF_LOADER_UPGRADEABLE_PROGRAM_ID,
+    DEFAULT_MIN_CHALLENGE_WINDOW_SECONDS,
     JOB_CLASS_NAME,
     JOB_STATUS,
+    MIN_CHALLENGE_WINDOW_SECONDS_BY_CLUSTER,
     NODE_ROLE_NAME,
     STAKE_TIER_NAME,
 )
@@ -76,12 +78,19 @@ class ProtocolAddresses:
 
 @dataclass(frozen=True)
 class InitializeProtocolArgs:
-    """`initialize_protocol` arguments. All floors are base units of the payment mint."""
+    """`initialize_protocol` arguments.
+
+    Stake floors are base units of the payment mint. `min_challenge_window_seconds` is
+    the smallest challenge window `open_job` will accept; see
+    `MIN_CHALLENGE_WINDOW_SECONDS_BY_CLUSTER` for the per-cluster values and why the
+    bound is configuration rather than a program constant.
+    """
 
     tier_one_stake_floor: int
     tier_two_stake_floor: int
     tier_three_stake_floor: int
     verifier_stake_floor: int
+    min_challenge_window_seconds: int
 
     def to_bytes(self) -> bytes:
         return b"".join(
@@ -90,6 +99,7 @@ class InitializeProtocolArgs:
                 u64(self.tier_two_stake_floor),
                 u64(self.tier_three_stake_floor),
                 u64(self.verifier_stake_floor),
+                u32(self.min_challenge_window_seconds),
             ]
         )
 
@@ -99,11 +109,23 @@ class InitializeProtocolArgs:
             "tier_two_stake_floor": self.tier_two_stake_floor,
             "tier_three_stake_floor": self.tier_three_stake_floor,
             "verifier_stake_floor": self.verifier_stake_floor,
+            "min_challenge_window_seconds": self.min_challenge_window_seconds,
         }
 
 
+def min_challenge_window_default(cluster_name: str) -> int:
+    """The challenge-window floor to initialize `cluster_name` with.
+
+    Unknown profiles get the mainnet value: a floor that is too high is a visible error
+    at `open_job`, while one that is too low silently reopens the hole it closes.
+    """
+    return MIN_CHALLENGE_WINDOW_SECONDS_BY_CLUSTER.get(
+        cluster_name, DEFAULT_MIN_CHALLENGE_WINDOW_SECONDS
+    )
+
+
 def validate_stake_floors(args: InitializeProtocolArgs) -> InitializeProtocolArgs:
-    """Client-side mirror of the program's `initialize_protocol` floor checks."""
+    """Client-side mirror of the program's `initialize_protocol` argument checks."""
     if not 0 < args.tier_one_stake_floor < args.tier_two_stake_floor < args.tier_three_stake_floor:
         raise ValueError("stake floors must satisfy 0 < tier one < tier two < tier three")
     if args.verifier_stake_floor <= 0:
@@ -111,6 +133,8 @@ def validate_stake_floors(args: InitializeProtocolArgs) -> InitializeProtocolArg
     for value in (args.tier_three_stake_floor, args.verifier_stake_floor):
         if value > 0xFFFF_FFFF_FFFF_FFFF:
             raise ValueError("stake floor does not fit in u64 base units")
+    if not 0 < args.min_challenge_window_seconds <= 0xFFFF_FFFF:
+        raise ValueError("minimum challenge window must be a positive number of seconds below 2^32")
     return args
 
 
@@ -123,7 +147,10 @@ def parse_tier_floors(text: str) -> tuple[str, str, str]:
 
 
 def stake_floors_from_human(
-    tier_floors: Sequence[str], verifier_floor: str, decimals: int
+    tier_floors: Sequence[str],
+    verifier_floor: str,
+    decimals: int,
+    min_challenge_window_seconds: int,
 ) -> InitializeProtocolArgs:
     """Convert human-unit floors to base units with the mint's decimals, then validate."""
     if len(tier_floors) != 3:
@@ -135,6 +162,7 @@ def stake_floors_from_human(
             tier_two_stake_floor=tier_two,
             tier_three_stake_floor=tier_three,
             verifier_stake_floor=parse_base_units(verifier_floor, decimals),
+            min_challenge_window_seconds=min_challenge_window_seconds,
         )
     )
 
@@ -150,6 +178,7 @@ class ProtocolConfigAccount:
     tier_two_stake_floor: int
     tier_three_stake_floor: int
     verifier_stake_floor: int
+    min_challenge_window_seconds: int
 
     def addresses(self, program_id: Pubkey) -> ProtocolAddresses:
         return ProtocolAddresses(program_id, self.payment_mint, self.token_program)
@@ -165,6 +194,7 @@ class ProtocolConfigAccount:
             "tier_two_stake_floor": self.tier_two_stake_floor,
             "tier_three_stake_floor": self.tier_three_stake_floor,
             "verifier_stake_floor": self.verifier_stake_floor,
+            "min_challenge_window_seconds": self.min_challenge_window_seconds,
         }
 
 
@@ -772,6 +802,7 @@ def decode_config(data: bytes) -> ProtocolConfigAccount:
     tier_two, offset = read_u64(data, offset)
     tier_three, offset = read_u64(data, offset)
     verifier, offset = read_u64(data, offset)
+    min_challenge_window_seconds, offset = read_u32(data, offset)
     return ProtocolConfigAccount(
         bump,
         admin,
@@ -782,6 +813,7 @@ def decode_config(data: bytes) -> ProtocolConfigAccount:
         tier_two,
         tier_three,
         verifier,
+        min_challenge_window_seconds,
     )
 
 

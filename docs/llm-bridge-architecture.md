@@ -163,10 +163,13 @@ not supply one either: the aggregate guest reads only receipt bytes, and neither
 economic and social. `docs/proof-layer-status.md`, "What the chain enforces about a
 branch", states the full position and records the open item.
 
-Proving is tens of seconds of CPU per branch, so it is opt-in per worker. A branch job
-whose execution window is shorter than the prove time would be slashed for a proof it
-could not finish. `KSWARM_ZKVM_REQUIRE_RECEIPT=1` makes a verifier refuse branches
-without one.
+Proving is tens of seconds of CPU per branch, and it is on by default in the images:
+`branch-worker` and `verifier-worker` set `KSWARM_ZKVM_HOST` themselves and
+`docker-compose.swarm.yml` also sets `KSWARM_ZKVM_REQUIRE_RECEIPT=1`, so the verifier in
+that stack refuses a branch without a receipt. Outside those images the variable is
+unset and a worker proves nothing. Turning it off is `KSWARM_ZKVM_HOST=`, explicitly
+empty. The window still has to allow for it: a branch job whose execution window is
+shorter than the prove time would be slashed for a proof it could not finish.
 
 The `branch-worker` and `verifier-worker` images carry the host binary and the id of the
 guest compiled into it, and default `KSWARM_ZKVM_HOST` and `KSWARM_ZKVM_IMAGE_ID_FILE`

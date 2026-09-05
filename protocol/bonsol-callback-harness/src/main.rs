@@ -47,6 +47,12 @@ const TIER_ONE_STAKE_FLOOR: u64 = 50_000 * UNIT;
 const TIER_TWO_STAKE_FLOOR: u64 = 250_000 * UNIT;
 const TIER_THREE_STAKE_FLOOR: u64 = 1_000_000 * UNIT;
 const VERIFIER_STAKE_FLOOR: u64 = 100_000 * UNIT;
+// `ProtocolConfig.min_challenge_window_seconds`: the smallest challenge window `open_job`
+// accepts. This harness drives a local validator and waits out the window in real time, so
+// it initializes with the `local` cluster profile's value and opens jobs exactly at it. A
+// deployment sizes the floor in `ATTESTATION_WINDOW_SECONDS` rungs instead; see
+// `docs/kai-payment-token.md`.
+const MIN_CHALLENGE_WINDOW_SECONDS: u32 = 5;
 const DEFAULT_INPUT_JSON: &str = "{\"branch_key\":\"baseline\",\"child_job_id\":\"child-baseline-1\",\"parent_request_id\":\"parent-bonsol-eval\",\"line_count\":3,\"word_count\":17,\"score_hex\":\"003a000000000000000000000000000000000000000000000000000000000000\"}";
 
 /// The payment mint and the token program that owns it, as pinned in `ProtocolConfig`.
@@ -620,6 +626,7 @@ fn setup_production_protocol(
         data.extend_from_slice(&TIER_TWO_STAKE_FLOOR.to_le_bytes());
         data.extend_from_slice(&TIER_THREE_STAKE_FLOOR.to_le_bytes());
         data.extend_from_slice(&VERIFIER_STAKE_FLOOR.to_le_bytes());
+        data.extend_from_slice(&MIN_CHALLENGE_WINDOW_SECONDS.to_le_bytes());
         send_tx(
             rpc,
             &[Instruction::new_with_bytes(
@@ -965,7 +972,7 @@ fn open_aggregate_job(
     data.extend_from_slice(&image_id);
     data.extend_from_slice(&90u32.to_le_bytes());
     data.extend_from_slice(&90u32.to_le_bytes());
-    data.extend_from_slice(&5u32.to_le_bytes());
+    data.extend_from_slice(&MIN_CHALLENGE_WINDOW_SECONDS.to_le_bytes());
     data.extend_from_slice(&CHALLENGE_BOND.to_le_bytes());
     send_tx(
         rpc,

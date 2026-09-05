@@ -4,8 +4,9 @@
 # so they are excluded here and run on hosts that have them.
 #
 # Everything is pinned, and every job reads its own test count back out of the
-# log. A suite that collected nothing exits 0, and so does one that was quietly
-# narrowed, so "the step was green" is not on its own evidence that the tests ran.
+# log and fails below a floor. A suite that collected nothing exits 0, and so
+# does one that was quietly narrowed, so "the step was green" is not on its own
+# evidence that the tests ran.
 #
 #   runs-on   ubuntu-24.04, not ubuntu-latest: GitHub moves the -latest label
 #             between images (Ubuntu 26.04 is already published) and that would
@@ -31,11 +32,22 @@ env:
   UV_VERSION: "0.12.9"
   PYTHON_VERSION: "3.12"
   NODE_VERSION: "22.23.2"
-  # Measured on 2026-09-04 with `-m "not integration"`. Change one of these only
-  # together with the suite it counts.
-  CLI_TEST_COUNT: "315"
-  WORKER_TEST_COUNT: "151"
-  NODE_TEST_COUNT: "44"
+  # Floors, not exact sizes: each is passed to scripts/ci/assert-test-count.sh
+  # as `>=N`, so adding tests upstream cannot turn this repository red before
+  # anyone here re-measures. An exact pin did exactly that on 2026-09-04: the
+  # CLI suite had grown to 322 while this file still said 315, every test
+  # passed, and the job failed on the number. A shortfall -- the failure the
+  # count exists to catch, where a suite is silently narrowed or skips itself
+  # and still exits 0 -- is rejected either way.
+  #
+  # These are the source tree's `CLI_MIN_TESTS`, `WORKER_MIN_TESTS` and
+  # `NODE_MIN_TESTS` in `scripts/ci/pins.env`, which records how each was
+  # measured. That file is not part of this export and a workflow `env:` block
+  # cannot source one, so the values are copied here; the export's own test
+  # suite fails if the copy and the declaration disagree.
+  CLI_MIN_TESTS: "322"
+  WORKER_MIN_TESTS: "151"
+  NODE_MIN_TESTS: "44"
 
 jobs:
   secrets:
@@ -91,15 +103,17 @@ jobs:
       # Encoder and account layouts asserted against the program source, Bonsol
       # binding vectors, run-manifest logic, command flows against a fake chain.
       #
-      # The count is the check that the layout tests actually ran: without the
-      # program source they skip themselves, and a skipped test is not a passing
-      # one, so the total falls short and this step fails.
+      # The floor is the check that the layout tests actually ran: without the
+      # program source placed above they skip themselves, and a skipped test is
+      # not a passing one. That is 49 of them -- 273 passed and 49 skipped
+      # instead of 322 passed -- which is far below the floor, so this step
+      # fails rather than quietly shipping unchecked encoders.
       - name: Test
         working-directory: cli
         run: |
           set -euo pipefail
           uv run --locked pytest -q -m "not integration" 2>&1 | tee "${RUNNER_TEMP}/cli.log"
-          ../scripts/ci/assert-test-count.sh pytest "${CLI_TEST_COUNT}" "${RUNNER_TEMP}/cli.log"
+          ../scripts/ci/assert-test-count.sh pytest ">=${CLI_MIN_TESTS}" "${RUNNER_TEMP}/cli.log"
 
   worker:
     name: Worker unit tests
@@ -126,7 +140,7 @@ jobs:
           set -euo pipefail
           PYTHONPATH="${GITHUB_WORKSPACE}/backend" \
             uv run pytest -q -m "not integration" 2>&1 | tee "${RUNNER_TEMP}/worker.log"
-          ../scripts/ci/assert-test-count.sh pytest "${WORKER_TEST_COUNT}" "${RUNNER_TEMP}/worker.log"
+          ../scripts/ci/assert-test-count.sh pytest ">=${WORKER_MIN_TESTS}" "${RUNNER_TEMP}/worker.log"
 
   node:
     name: Node control-plane tests
@@ -156,4 +170,4 @@ jobs:
         run: |
           set -euo pipefail
           node --test "test/**/*.test.mjs" 2>&1 | tee "${RUNNER_TEMP}/node.log"
-          ../scripts/ci/assert-test-count.sh node "${NODE_TEST_COUNT}" "${RUNNER_TEMP}/node.log"
+          ../scripts/ci/assert-test-count.sh node ">=${NODE_MIN_TESTS}" "${RUNNER_TEMP}/node.log"

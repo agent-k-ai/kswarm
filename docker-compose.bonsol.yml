@@ -49,17 +49,28 @@ services:
     # authority, and a `--bpf-program` account has no ProgramData and therefore no
     # upgrade authority at all: the protocol could never be initialized on this
     # validator. Bonsol's own two programs stay non-upgradeable; nothing checks them.
+    #
+    # This is the only definition of the validator's flags. `docker-compose.dev.yml`
+    # extends this service instead of restating them, because a second copy is how the
+    # program came to be loaded non-upgradeably in the dev stack while this one was
+    # correct. The one thing that stack needs to differ is the ledger directory, so that
+    # is an environment variable rather than a reason to override the entrypoint.
     entrypoint:
       - /bin/bash
       - -lc
       - |
         set -euo pipefail
         authority="$$(solana-keygen pubkey /runtime/bonsol/client-keypair.json)"
+        set --
+        if [ -n "$${BONSOL_VALIDATOR_LEDGER:-}" ]; then
+          set -- --ledger "$${BONSOL_VALIDATOR_LEDGER}"
+        fi
         exec solana-test-validator \
           --reset \
           --limit-ledger-size 100000 \
           --bind-address 0.0.0.0 \
           --rpc-pubsub-enable-block-subscription \
+          "$$@" \
           --bpf-program BoNsHRcyLLNdtnoDf8hiCNZpyehMC4FDMxs6NTxFi3ew /runtime/bonsol/bonsol.so \
           --bpf-program exay1T7QqsJPNcwzMiWubR6vZnqrgM16jZRraHgqBGG /runtime/bonsol/callback_example.so \
           --upgradeable-program ERNzRcYhX6UYboXAAP7vwzbCKsULYu21R4RFNvDD8CkM /runtime/bonsol/kswarm_protocol.so "$$authority"

@@ -16,7 +16,7 @@ source runtime/handson.env
 cd cli
 ```
 
-The bootstrap starts Kubo IPFS, the Bonsol stack, and the local Solana validator. It creates `admin`, `customer`, `worker-a`, `verifier`, and `aggregator`, creates a stand-in KAI mint (classic SPL Token, 6 decimals), initializes the protocol with the default stake floors, registers the worker roles, stakes each operator above its floor (`worker-a` at tier two), and writes `~/.config/kswarm/handson-state.json`.
+The bootstrap starts Kubo IPFS, the Bonsol stack, and the local Solana validator. The validator loads the protocol program as an upgradeable program whose authority is the Bonsol client keypair, because `initialize_protocol` accepts only the program's upgrade authority, so the bootstrap installs that keypair as the `admin` wallet before anything else. An `admin` wallet that already exists and holds a different key is not overwritten: the bootstrap stops and tells you to move it aside. It creates `admin`, `customer`, `worker-a`, `verifier`, and `aggregator`, creates a stand-in KAI mint (classic SPL Token, 6 decimals), initializes the protocol with the default stake floors, registers the worker roles, stakes each operator above its floor (`worker-a` at tier two), and writes `~/.config/kswarm/handson-state.json`.
 
 If the host does not have `uv` or a Python version compatible with the CLI package, use the Docker-backed command printed by `make handson-up`. The bootstrap provisions the `python-toolchain` container for that path.
 
